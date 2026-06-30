@@ -28,12 +28,7 @@ def test_format_notice_contains_group_applicant_action_and_reason():
         sub_type="add",
     )
 
-    text = format_notice(
-        title="加群审核通过",
-        request=request,
-        action="approve",
-        reason="符合条件",
-    )
+    text = format_notice("加群审核通过", request, "approve", "符合条件")
 
     assert "123456" in text
     assert "10001" in text
@@ -46,12 +41,7 @@ def test_format_notice_contains_group_applicant_action_and_reason():
 async def test_send_admin_notice_sends_private_messages_to_all_admins():
     context = FakeContext()
 
-    await send_admin_notice(
-        context,
-        admin_qq_ids=["10001", "10002"],
-        text="通知内容",
-        platform_name="aiocqhttp",
-    )
+    await send_admin_notice(context, ["10001", "10002"], "通知内容", "aiocqhttp")
 
     assert [target for target, _ in context.sent] == [
         "aiocqhttp:FriendMessage:10001",

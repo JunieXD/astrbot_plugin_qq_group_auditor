@@ -27,7 +27,6 @@ def private_umo(platform_name: str, qq_id: str) -> str:
 
 
 def format_notice(
-    *,
     title: str,
     request: JoinRequest,
     action: str,
@@ -50,7 +49,6 @@ def format_notice(
 
 async def send_admin_notice(
     context: Any,
-    *,
     admin_qq_ids: list[str],
     text: str,
     platform_name: str = "aiocqhttp",
