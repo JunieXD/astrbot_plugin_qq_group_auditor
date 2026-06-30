@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from qq_group_auditor.config import (
     DEFAULT_REJECT_REASON,
+    DEFAULT_REVIEW_PROMPT,
     find_group_config,
     is_group_admin,
     normalize_config,
@@ -56,6 +57,68 @@ def test_invalid_failure_action_defaults_to_ignore():
     )
 
     assert config["group_audits"][0]["failure_action"] == "ignore"
+
+
+def test_empty_review_prompt_uses_default():
+    config = normalize_config(
+        {
+            "group_audits": [
+                {"group_id": "1"},
+                {"group_id": "2", "review_prompt": "   "},
+            ]
+        }
+    )
+
+    assert config["group_audits"][0]["review_prompt"] == DEFAULT_REVIEW_PROMPT
+    assert config["group_audits"][1]["review_prompt"] == DEFAULT_REVIEW_PROMPT
+
+
+def test_empty_group_id_items_are_skipped():
+    config = normalize_config(
+        {
+            "group_audits": [
+                {"group_id": "", "review_prompt": "A"},
+                {"group_id": "   ", "review_prompt": "B"},
+                {"review_prompt": "C"},
+                {"group_id": "3", "review_prompt": "D"},
+            ]
+        }
+    )
+
+    assert [item["group_id"] for item in config["group_audits"]] == ["3"]
+
+
+def test_string_bool_values_are_normalized():
+    config = normalize_config(
+        {
+            "group_audits": [
+                {
+                    "group_id": "1",
+                    "enabled": "false",
+                    "notify_on_approve": "true",
+                    "notify_on_reject": "0",
+                    "notify_on_ignore": "on",
+                },
+                {
+                    "group_id": "2",
+                    "enabled": "yes",
+                    "notify_on_approve": "off",
+                    "notify_on_reject": "1",
+                    "notify_on_ignore": "",
+                },
+            ]
+        }
+    )
+
+    first, second = config["group_audits"]
+    assert first["enabled"] is False
+    assert first["notify_on_approve"] is True
+    assert first["notify_on_reject"] is False
+    assert first["notify_on_ignore"] is True
+    assert second["enabled"] is True
+    assert second["notify_on_approve"] is False
+    assert second["notify_on_reject"] is True
+    assert second["notify_on_ignore"] is False
 
 
 def test_find_group_config_ignores_disabled_groups():
