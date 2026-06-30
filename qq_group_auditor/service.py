@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 from .models import ActionResult, JoinRequest, ReviewDecision
@@ -30,16 +31,23 @@ class NotifierPort(Protocol):
         ...
 
 
+class LoggerPort(Protocol):
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        ...
+
+
 class AuditService:
     def __init__(
         self,
         reviewer: ReviewerPort,
         platform: PlatformPort,
         notifier: NotifierPort,
+        logger: LoggerPort | None = None,
     ) -> None:
         self.reviewer = reviewer
         self.platform = platform
         self.notifier = notifier
+        self.logger = logger or logging.getLogger(__name__)
 
     async def handle_request(
         self,
@@ -49,7 +57,7 @@ class AuditService:
         try:
             decision = await self._decision_for_request(group_config, request)
         except LLMReviewError as exc:
-            await self.notifier.notify(
+            await self._notify_safely(
                 group_config=group_config,
                 request=request,
                 title="LLM审核异常",
@@ -65,7 +73,7 @@ class AuditService:
                 await self._notify_platform_error(group_config, request, "approve", exc)
                 return ActionResult(action="error", reason=str(exc))
             if group_config.get("notify_on_approve", False):
-                await self.notifier.notify(
+                await self._notify_safely(
                     group_config=group_config,
                     request=request,
                     title="加群审核通过",
@@ -86,7 +94,7 @@ class AuditService:
                 await self._notify_platform_error(group_config, request, "reject", exc)
                 return ActionResult(action="error", reason=str(exc))
             if group_config.get("notify_on_reject", False):
-                await self.notifier.notify(
+                await self._notify_safely(
                     group_config=group_config,
                     request=request,
                     title="加群审核拒绝",
@@ -96,7 +104,7 @@ class AuditService:
             return ActionResult(action="reject", reason=decision.reason)
 
         if group_config.get("notify_on_ignore", False):
-            await self.notifier.notify(
+            await self._notify_safely(
                 group_config=group_config,
                 request=request,
                 title="加群审核忽略",
@@ -121,10 +129,32 @@ class AuditService:
         action: str,
         exc: Exception,
     ) -> None:
-        await self.notifier.notify(
+        await self._notify_safely(
             group_config=group_config,
             request=request,
             title="平台审核接口异常",
             action=action,
             error=str(exc),
         )
+
+    async def _notify_safely(
+        self,
+        *,
+        group_config: dict[str, Any],
+        request: JoinRequest,
+        title: str,
+        action: str,
+        reason: str = "",
+        error: str = "",
+    ) -> None:
+        try:
+            await self.notifier.notify(
+                group_config=group_config,
+                request=request,
+                title=title,
+                action=action,
+                reason=reason,
+                error=error,
+            )
+        except Exception:
+            self.logger.warning("failed to send audit notification", exc_info=True)

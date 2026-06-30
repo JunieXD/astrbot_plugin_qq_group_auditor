@@ -38,6 +38,11 @@ class FakeNotifier:
         self.notices.append((group_config["admin_qq_ids"], f"{title}|{action}|{reason}|{error}"))
 
 
+class FailingNotifier:
+    async def notify(self, *, group_config, request, title, action, reason="", error=""):
+        raise RuntimeError("notify failed")
+
+
 def group_config(**overrides):
     config = {
         "group_id": "123",
@@ -131,3 +136,50 @@ async def test_llm_error_notifies_admin_and_leaves_request_untouched():
     assert platform.actions == []
     assert "LLM审核异常" in notifier.notices[0][1]
     assert "invalid json" in notifier.notices[0][1]
+
+
+@pytest.mark.asyncio
+async def test_approve_notice_failure_keeps_approve_result():
+    platform = FakePlatform()
+    service = AuditService(
+        FakeReviewer(ReviewDecision(True, "符合")),
+        platform,
+        FailingNotifier(),
+    )
+
+    result = await service.handle_request(group_config(notify_on_approve=True), request())
+
+    assert result.action == "approve"
+    assert result.reason == "符合"
+    assert platform.actions == [(request(), True, "")]
+
+
+@pytest.mark.asyncio
+async def test_llm_error_notice_failure_still_returns_error_result():
+    platform = FakePlatform()
+    service = AuditService(
+        FakeReviewer(LLMReviewError("invalid json")),
+        platform,
+        FailingNotifier(),
+    )
+
+    result = await service.handle_request(group_config(), request())
+
+    assert result.action == "error"
+    assert result.reason == "invalid json"
+    assert platform.actions == []
+
+
+@pytest.mark.asyncio
+async def test_platform_error_returns_error_and_notifies_admin():
+    platform = FakePlatform()
+    platform.fail = True
+    notifier = FakeNotifier()
+    service = AuditService(FakeReviewer(ReviewDecision(True, "符合")), platform, notifier)
+
+    result = await service.handle_request(group_config(), request())
+
+    assert result.action == "error"
+    assert "platform failed" in result.reason
+    assert platform.actions == []
+    assert notifier.notices[0][1].startswith("平台审核接口异常|approve||platform failed")
