@@ -1,0 +1,65 @@
+{
+  "group_audits": {
+    "description": "QQ群加群审核配置",
+    "type": "template_list",
+    "default": [],
+    "hint": "每条配置对应一个QQ群。Bot 必须是群管理员，自动审核才会生效。",
+    "templates": {
+      "group_audit": {
+        "name": "群审核配置",
+        "display_item": "group_id",
+        "items": {
+          "enabled": {
+            "description": "启用此群审核",
+            "type": "bool",
+            "default": true
+          },
+          "group_id": {
+            "description": "QQ群号",
+            "type": "string",
+            "default": "",
+            "hint": "填写要开启自动加群审核的 QQ 群号。"
+          },
+          "review_prompt": {
+            "description": "审核提示词",
+            "type": "text",
+            "default": "请判断申请人的加群答案是否符合本群要求。只有答案明确符合要求时才 approve=true。",
+            "hint": "描述什么样的答案可以通过。插件会额外要求 LLM 只返回 JSON。"
+          },
+          "failure_action": {
+            "description": "不符合时动作",
+            "type": "string",
+            "default": "ignore",
+            "hint": "填写 ignore 或 reject。ignore 表示不处理，reject 表示自动拒绝。"
+          },
+          "reject_reason": {
+            "description": "固定拒绝理由",
+            "type": "text",
+            "default": "加群答案不符合要求，请重新申请并按提示填写。"
+          },
+          "admin_qq_ids": {
+            "description": "管理员QQ号列表",
+            "type": "list",
+            "default": [],
+            "hint": "这些 QQ 会收到私聊通知，也可以使用 /qgaudit test。"
+          },
+          "notify_on_approve": {
+            "description": "正常通过时通知管理员",
+            "type": "bool",
+            "default": false
+          },
+          "notify_on_reject": {
+            "description": "正常拒绝时通知管理员",
+            "type": "bool",
+            "default": false
+          },
+          "notify_on_ignore": {
+            "description": "正常忽略时通知管理员",
+            "type": "bool",
+            "default": false
+          }
+        }
+      }
+    }
+  }
+}
