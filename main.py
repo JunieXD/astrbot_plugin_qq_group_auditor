@@ -7,12 +7,20 @@ from typing import Any
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 
-from qq_group_auditor.config import find_group_config, is_group_admin, normalize_config
-from qq_group_auditor.models import JoinRequest, ReviewDecision
-from qq_group_auditor.notifier import format_notice, send_admin_notice
-from qq_group_auditor.platform import extract_join_request, set_group_request
-from qq_group_auditor.reviewer import LLMReviewError, review_answer
-from qq_group_auditor.service import AuditService
+try:
+    from .qq_group_auditor.config import find_group_config, is_group_admin, normalize_config
+    from .qq_group_auditor.models import JoinRequest, ReviewDecision
+    from .qq_group_auditor.notifier import format_notice, send_admin_notice
+    from .qq_group_auditor.platform import extract_join_request, set_group_request
+    from .qq_group_auditor.reviewer import LLMReviewError, review_answer
+    from .qq_group_auditor.service import AuditService
+except ImportError:  # pragma: no cover - supports direct local imports in tests/dev.
+    from qq_group_auditor.config import find_group_config, is_group_admin, normalize_config
+    from qq_group_auditor.models import JoinRequest, ReviewDecision
+    from qq_group_auditor.notifier import format_notice, send_admin_notice
+    from qq_group_auditor.platform import extract_join_request, set_group_request
+    from qq_group_auditor.reviewer import LLMReviewError, review_answer
+    from qq_group_auditor.service import AuditService
 
 
 logger = logging.getLogger(__name__)

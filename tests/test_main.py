@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -241,6 +243,33 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     assert ("event_message_type", EventMessageType.ALL) in handler_meta
     assert ("event_message_type", EventMessageType.OTHER_MESSAGE) not in handler_meta
     assert ("platform_adapter_type", PlatformAdapterType.AIOCQHTTP) in handler_meta
+
+
+def test_imports_when_loaded_as_plugin_package(monkeypatch):
+    install_astrbot_stub(monkeypatch)
+    plugin_dir = Path(__file__).resolve().parents[1]
+    module_name = "astrbot_plugin_qq_group_auditor.main"
+    sanitized_path = [
+        entry
+        for entry in sys.path
+        if entry and Path(entry).resolve() != plugin_dir
+    ]
+    monkeypatch.setattr(sys, "path", sanitized_path)
+    for name in list(sys.modules):
+        if name == "qq_group_auditor" or name.startswith("qq_group_auditor."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    package = types.ModuleType("astrbot_plugin_qq_group_auditor")
+    package.__path__ = [str(plugin_dir)]
+    monkeypatch.setitem(sys.modules, "astrbot_plugin_qq_group_auditor", package)
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, plugin_dir / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+
+    spec.loader.exec_module(module)
+
+    assert hasattr(module, "QQGroupAuditorPlugin")
 
 
 def test_parse_test_command_accepts_optional_slash_and_preserves_answer_spaces(monkeypatch):
