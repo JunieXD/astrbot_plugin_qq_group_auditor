@@ -23,10 +23,13 @@ def extract_join_request(event: Any) -> JoinRequest | None:
     if _raw_get(raw, "post_type") != "request" or _raw_get(raw, "request_type") != "group":
         return None
 
+    sub_type = str(_raw_get(raw, "sub_type") or "add").strip() or "add"
+    if sub_type != "add":
+        return None
+
     group_id = str(_raw_get(raw, "group_id") or "").strip()
     user_id = str(_raw_get(raw, "user_id") or "").strip()
     flag = str(_raw_get(raw, "flag") or "").strip()
-    sub_type = str(_raw_get(raw, "sub_type") or "add").strip() or "add"
     answer = str(_raw_get(raw, "comment") or "").strip()
 
     if not group_id or not user_id or not flag:
@@ -50,8 +53,54 @@ def _iter_platforms(context: Any):
     return getattr(manager, "platform_insts", []) or []
 
 
-def find_onebot_bot(context: Any) -> Any:
+def _platform_meta_id(platform: Any) -> str | None:
+    meta = getattr(platform, "meta", None)
+    if not callable(meta):
+        return None
+    try:
+        metadata = meta()
+    except Exception:
+        return None
+    value = getattr(metadata, "id", None)
+    return str(value) if value is not None else None
+
+
+def _platform_metadata_id(platform: Any) -> str | None:
+    metadata = getattr(platform, "metadata", None)
+    value = getattr(metadata, "id", None)
+    return str(value) if value is not None else None
+
+
+def _platform_id(platform: Any) -> str | None:
+    value = getattr(platform, "id", None)
+    return str(value) if value is not None else None
+
+
+def _platform_config_id(platform: Any) -> str | None:
+    config = getattr(platform, "config", None)
+    if not isinstance(config, dict):
+        return None
+    value = config.get("id")
+    return str(value) if value is not None else None
+
+
+def _platform_matches_id(platform: Any, platform_id: str) -> bool:
+    return platform_id in {
+        value
+        for value in (
+            _platform_meta_id(platform),
+            _platform_metadata_id(platform),
+            _platform_id(platform),
+            _platform_config_id(platform),
+        )
+        if value is not None
+    }
+
+
+def find_onebot_bot(context: Any, platform_id: str | None = None) -> Any:
     for platform in _iter_platforms(context):
+        if platform_id is not None and not _platform_matches_id(platform, platform_id):
+            continue
         bot = getattr(platform, "bot", None)
         if bot is not None and hasattr(bot, "call_action"):
             return bot
@@ -65,8 +114,9 @@ async def set_group_request(
     sub_type: str,
     approve: bool,
     reason: str,
+    platform_id: str | None = None,
 ) -> None:
-    bot = find_onebot_bot(context)
+    bot = find_onebot_bot(context, platform_id=platform_id)
     try:
         await bot.call_action(
             action="set_group_add_request",
