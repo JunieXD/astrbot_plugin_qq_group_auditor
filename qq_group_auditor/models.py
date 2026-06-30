@@ -24,3 +24,18 @@ class GroupAuditConfig:
 class ReviewDecision:
     approve: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class JoinRequest:
+    group_id: str
+    applicant_qq: str
+    answer: str
+    flag: str
+    sub_type: str
+
+
+@dataclass(frozen=True)
+class ActionResult:
+    action: str
+    reason: str = ""
