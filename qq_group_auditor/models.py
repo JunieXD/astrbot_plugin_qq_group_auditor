@@ -18,3 +18,9 @@ class GroupAuditConfig:
     notify_on_approve: bool
     notify_on_reject: bool
     notify_on_ignore: bool
+
+
+@dataclass(frozen=True)
+class ReviewDecision:
+    approve: bool
+    reason: str
