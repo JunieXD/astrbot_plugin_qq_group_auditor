@@ -3,14 +3,8 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-from dataclasses import dataclass
 
 import pytest
-
-
-@dataclass
-class SentMessage:
-    text: str
 
 
 class MessageChain:
@@ -40,11 +34,6 @@ class CommandGroup:
     def __init__(self, name: str):
         self.name = name
 
-    def __call__(self, func):
-        func.__qgaudit_filter_meta__ = getattr(func, "__qgaudit_filter_meta__", [])
-        func.__qgaudit_filter_meta__.append(("command_group", self.name))
-        return func
-
     def command(self, name: str):
         def decorator(func):
             func.__qgaudit_filter_meta__ = getattr(func, "__qgaudit_filter_meta__", [])
@@ -58,9 +47,15 @@ def install_astrbot_stub(monkeypatch: pytest.MonkeyPatch):
     command_groups: list[CommandGroup] = []
 
     def command_group(name: str):
-        group = CommandGroup(name)
-        command_groups.append(group)
-        return group
+        def decorator(func):
+            group = CommandGroup(name)
+            group.func = func
+            command_groups.append(group)
+            func.__qgaudit_filter_meta__ = getattr(func, "__qgaudit_filter_meta__", [])
+            func.__qgaudit_filter_meta__.append(("command_group", name))
+            return group
+
+        return decorator
 
     def event_message_type(event_type):
         def decorator(func):
@@ -142,9 +137,10 @@ class FakeProvider:
 
 
 class FakeContext:
-    def __init__(self, current_provider_id="provider-current"):
+    def __init__(self, current_provider_id="provider-current", fallback_provider=None):
         self.llm_calls = []
         self.current_provider_id = current_provider_id
+        self.fallback_provider = FakeProvider() if fallback_provider is None else fallback_provider
 
     async def get_current_chat_provider_id(self, umo):
         self.current_umo = umo
@@ -152,7 +148,7 @@ class FakeContext:
 
     def get_using_provider(self, value):
         self.fallback_arg = value
-        return FakeProvider()
+        return self.fallback_provider
 
     async def llm_generate(self, **kwargs):
         self.llm_calls.append(kwargs)
@@ -169,7 +165,6 @@ class FakeEvent:
     ):
         self.message_str = message
         self.sender_id = sender_id
-        self.replies: list[str] = []
         self.platform_id = platform_id
 
     def get_sender_id(self):
@@ -178,8 +173,8 @@ class FakeEvent:
     def get_platform_id(self):
         return self.platform_id
 
-    async def reply(self, chain):
-        self.replies.append(chain.get_plain_text())
+    def plain_result(self, text: str):
+        return text
 
 
 class FakeRequestEvent:
@@ -211,6 +206,10 @@ def plugin_config():
             }
         ]
     }
+
+
+async def collect(async_iterable):
+    return [item async for item in async_iterable]
 
 
 def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
@@ -254,9 +253,9 @@ async def test_private_test_command_requires_group_admin(monkeypatch):
     plugin = module.QQGroupAuditorPlugin(context, plugin_config())
     event = FakeEvent(message="qgaudit test 123 任何答案", sender_id="20002")
 
-    await plugin.qgaudit_test(event)
+    results = await collect(plugin.qgaudit_test(event))
 
-    assert event.replies == ["无权限"]
+    assert results == ["无权限"]
     assert context.llm_calls == []
 
 
@@ -269,9 +268,9 @@ async def test_private_test_command_reviews_with_current_provider_and_keeps_answ
     plugin = module.QQGroupAuditorPlugin(context, plugin_config())
     event = FakeEvent(message="qgaudit test 123 alpha  beta", sender_id="10001")
 
-    await plugin.qgaudit_test(event)
+    results = await collect(plugin.qgaudit_test(event))
 
-    assert event.replies == ["approve=True reason=符合规则"]
+    assert results == ["approve=True reason=符合规则"]
     assert context.llm_calls[0]["chat_provider_id"] == "provider-current"
     assert "alpha  beta" in context.llm_calls[0]["prompt"]
 
@@ -294,6 +293,19 @@ async def test_llm_client_falls_back_to_using_provider_meta_id(monkeypatch):
             "prompt": "prompt",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_raises_when_provider_is_missing(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext(current_provider_id="", fallback_provider=None)
+    context.fallback_provider = None
+    client = module.AstrBotLLMClient(context, "umo-1")
+
+    with pytest.raises(RuntimeError, match="Provider not found"):
+        await client.generate(system_prompt="system", prompt="prompt")
+
+    assert context.llm_calls == []
 
 
 @pytest.mark.asyncio

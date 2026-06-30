@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Any
 
-from astrbot.api.event import MessageChain, filter
+from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 
 from qq_group_auditor.config import find_group_config, is_group_admin, normalize_config
@@ -16,7 +16,11 @@ from qq_group_auditor.service import AuditService
 
 
 logger = logging.getLogger(__name__)
-qgaudit = filter.command_group("qgaudit")
+
+
+@filter.command_group("qgaudit")
+def qgaudit():
+    pass
 
 
 class AstrBotLLMClient:
@@ -40,7 +44,10 @@ class AstrBotLLMClient:
                 return provider_id
         provider = self.context.get_using_provider(None)
         meta = provider.meta() if provider is not None and hasattr(provider, "meta") else None
-        return getattr(meta, "id", None)
+        provider_id = getattr(meta, "id", None)
+        if not provider_id:
+            raise RuntimeError("Provider not found")
+        return provider_id
 
 
 class RuntimeReviewer:
@@ -116,10 +123,6 @@ def parse_test_command(message_str: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2)
 
 
-async def _reply(event: Any, text: str) -> None:
-    await event.reply(MessageChain().message(text))
-
-
 def _event_message_text(event: Any) -> str:
     for attr in ("message_str", "message", "raw_message"):
         value = getattr(event, attr, None)
@@ -184,17 +187,17 @@ class QQGroupAuditorPlugin(Star):
     async def qgaudit_test(self, event: Any) -> None:
         parsed = parse_test_command(_event_message_text(event))
         if parsed is None:
-            await _reply(event, "用法：/qgaudit test <群号> <申请答案>")
+            yield event.plain_result("用法：/qgaudit test <群号> <申请答案>")
             return
 
         group_id, answer = parsed
         if not is_group_admin(self.config, group_id, _sender_id(event)):
-            await _reply(event, "无权限")
+            yield event.plain_result("无权限")
             return
 
         group_config = find_group_config(self.config, group_id)
         if group_config is None:
-            await _reply(event, "群未配置或未启用")
+            yield event.plain_result("群未配置或未启用")
             return
 
         request = JoinRequest(
@@ -210,7 +213,7 @@ class QQGroupAuditorPlugin(Star):
                 request=request,
             )
         except LLMReviewError as exc:
-            await _reply(event, f"LLM审核异常：{exc}")
+            yield event.plain_result(f"LLM审核异常：{exc}")
             return
 
-        await _reply(event, f"approve={decision.approve} reason={decision.reason}")
+        yield event.plain_result(f"approve={decision.approve} reason={decision.reason}")
