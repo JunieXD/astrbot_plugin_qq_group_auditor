@@ -137,13 +137,21 @@ class FakeProvider:
 
 
 class FakeContext:
-    def __init__(self, current_provider_id="provider-current", fallback_provider=None):
+    def __init__(
+        self,
+        current_provider_id="provider-current",
+        fallback_provider=None,
+        current_provider_exception: Exception | None = None,
+    ):
         self.llm_calls = []
         self.current_provider_id = current_provider_id
         self.fallback_provider = FakeProvider() if fallback_provider is None else fallback_provider
+        self.current_provider_exception = current_provider_exception
 
     async def get_current_chat_provider_id(self, umo):
         self.current_umo = umo
+        if self.current_provider_exception is not None:
+            raise self.current_provider_exception
         return self.current_provider_id
 
     def get_using_provider(self, value):
@@ -162,10 +170,12 @@ class FakeEvent:
         message: str,
         sender_id: str = "10001",
         platform_id: str = "napcat-1",
+        unified_msg_origin: str = "private-umo-1",
     ):
         self.message_str = message
         self.sender_id = sender_id
         self.platform_id = platform_id
+        self.unified_msg_origin = unified_msg_origin
 
     def get_sender_id(self):
         return self.sender_id
@@ -179,6 +189,7 @@ class FakeEvent:
 
 class FakeRequestEvent:
     def __init__(self):
+        self.unified_msg_origin = "group-request-umo-1"
         self.message_obj = types.SimpleNamespace(
             raw_message={
                 "post_type": "request",
@@ -276,9 +287,48 @@ async def test_private_test_command_reviews_with_current_provider_and_keeps_answ
 
 
 @pytest.mark.asyncio
+async def test_private_test_command_uses_event_unified_msg_origin_for_provider(
+    monkeypatch,
+):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    event = FakeEvent(
+        message="qgaudit test 123 alpha",
+        sender_id="10001",
+        unified_msg_origin="private-umo-42",
+    )
+
+    results = await collect(plugin.qgaudit_test(event))
+
+    assert results == ["approve=True reason=符合规则"]
+    assert context.current_umo == "private-umo-42"
+
+
+@pytest.mark.asyncio
 async def test_llm_client_falls_back_to_using_provider_meta_id(monkeypatch):
     module, _ = import_main(monkeypatch)
     context = FakeContext(current_provider_id="")
+    client = module.AstrBotLLMClient(context, "umo-1")
+
+    result = await client.generate(system_prompt="system", prompt="prompt")
+
+    assert result == FakeResponse.completion_text
+    assert context.current_umo == "umo-1"
+    assert context.fallback_arg is None
+    assert context.llm_calls == [
+        {
+            "chat_provider_id": "provider-fallback",
+            "system_prompt": "system",
+            "prompt": "prompt",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_falls_back_when_current_provider_lookup_raises(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext(current_provider_exception=RuntimeError("provider lookup failed"))
     client = module.AstrBotLLMClient(context, "umo-1")
 
     result = await client.generate(system_prompt="system", prompt="prompt")
@@ -333,6 +383,24 @@ async def test_group_request_handler_uses_raw_request_event_and_platform_id(
             "platform_id": "napcat-1",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_group_request_handler_uses_event_unified_msg_origin_for_provider(
+    monkeypatch,
+):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+
+    async def fake_set_group_request(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+
+    await plugin.handle_group_request(FakeRequestEvent())
+
+    assert context.current_umo == "group-request-umo-1"
 
 
 @pytest.mark.asyncio

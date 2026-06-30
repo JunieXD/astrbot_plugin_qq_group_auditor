@@ -38,10 +38,14 @@ class AstrBotLLMClient:
         return str(getattr(response, "completion_text", ""))
 
     async def _provider_id(self) -> Any:
-        if hasattr(self.context, "get_current_chat_provider_id"):
-            provider_id = await self.context.get_current_chat_provider_id(self.umo)
-            if provider_id:
-                return provider_id
+        if self.umo and hasattr(self.context, "get_current_chat_provider_id"):
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(self.umo)
+            except Exception:
+                logger.debug("failed to resolve current chat provider", exc_info=True)
+            else:
+                if provider_id:
+                    return provider_id
         provider = self.context.get_using_provider(None)
         meta = provider.meta() if provider is not None and hasattr(provider, "meta") else None
         provider_id = getattr(meta, "id", None)
@@ -175,7 +179,7 @@ class QQGroupAuditorPlugin(Star):
             return
 
         service = AuditService(
-            RuntimeReviewer(self.context),
+            RuntimeReviewer(self.context, getattr(event, "unified_msg_origin", None)),
             RuntimePlatform(self.context, platform_id=_platform_id(event)),
             RuntimeNotifier(self.context),
             logger=logger,
@@ -208,7 +212,10 @@ class QQGroupAuditorPlugin(Star):
             sub_type="add",
         )
         try:
-            decision = await RuntimeReviewer(self.context).review(
+            decision = await RuntimeReviewer(
+                self.context,
+                getattr(event, "unified_msg_origin", None),
+            ).review(
                 group_config=group_config,
                 request=request,
             )
