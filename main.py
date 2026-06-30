@@ -25,7 +25,7 @@ class AstrBotLLMClient:
         self.umo = umo
 
     async def generate(self, *, system_prompt: str, prompt: str) -> str:
-        chat_provider_id = self._provider_id()
+        chat_provider_id = await self._provider_id()
         response = await self.context.llm_generate(
             chat_provider_id=chat_provider_id,
             system_prompt=system_prompt,
@@ -33,12 +33,14 @@ class AstrBotLLMClient:
         )
         return str(getattr(response, "completion_text", ""))
 
-    def _provider_id(self) -> Any:
+    async def _provider_id(self) -> Any:
         if hasattr(self.context, "get_current_chat_provider_id"):
-            provider_id = self.context.get_current_chat_provider_id(self.umo)
+            provider_id = await self.context.get_current_chat_provider_id(self.umo)
             if provider_id:
                 return provider_id
-        return self.context.get_using_provider(None)
+        provider = self.context.get_using_provider(None)
+        meta = provider.meta() if provider is not None and hasattr(provider, "meta") else None
+        return getattr(meta, "id", None)
 
 
 class RuntimeReviewer:
@@ -97,11 +99,14 @@ class RuntimeNotifier:
         error: str = "",
     ) -> None:
         text = format_notice(title, request, action, reason=reason, error=error)
-        await send_admin_notice(
-            self.context,
-            list(group_config.get("admin_qq_ids") or []),
-            text,
-        )
+        try:
+            await send_admin_notice(
+                self.context,
+                list(group_config.get("admin_qq_ids") or []),
+                text,
+            )
+        except Exception:
+            logger.warning("failed to send audit notification", exc_info=True)
 
 
 def parse_test_command(message_str: str) -> tuple[str, str] | None:
@@ -174,6 +179,7 @@ class QQGroupAuditorPlugin(Star):
         )
         await service.handle_request(group_config, request)
 
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @qgaudit.command("test")
     async def qgaudit_test(self, event: Any) -> None:
         parsed = parse_test_command(_event_message_text(event))

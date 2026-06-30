@@ -28,6 +28,7 @@ class MessageChain:
 class EventMessageType:
     ALL = "ALL"
     GROUP_MESSAGE = "GROUP_MESSAGE"
+    PRIVATE_MESSAGE = "PRIVATE_MESSAGE"
     OTHER_MESSAGE = "OTHER_MESSAGE"
 
 
@@ -131,17 +132,27 @@ class FakeResponse:
     completion_text = '{"approve": true, "reason": "符合规则"}'
 
 
-class FakeContext:
-    def __init__(self):
-        self.llm_calls = []
+class FakeProviderMeta:
+    id = "provider-fallback"
 
-    def get_current_chat_provider_id(self, umo):
+
+class FakeProvider:
+    def meta(self):
+        return FakeProviderMeta()
+
+
+class FakeContext:
+    def __init__(self, current_provider_id="provider-current"):
+        self.llm_calls = []
+        self.current_provider_id = current_provider_id
+
+    async def get_current_chat_provider_id(self, umo):
         self.current_umo = umo
-        return "provider-current"
+        return self.current_provider_id
 
     def get_using_provider(self, value):
         self.fallback_arg = value
-        return "provider-fallback"
+        return FakeProvider()
 
     async def llm_generate(self, **kwargs):
         self.llm_calls.append(kwargs)
@@ -210,6 +221,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
     assert ("command", "qgaudit", "test") in command_meta
+    assert ("event_message_type", EventMessageType.PRIVATE_MESSAGE) in command_meta
 
     handler_meta = getattr(
         module.QQGroupAuditorPlugin.handle_group_request,
@@ -265,6 +277,26 @@ async def test_private_test_command_reviews_with_current_provider_and_keeps_answ
 
 
 @pytest.mark.asyncio
+async def test_llm_client_falls_back_to_using_provider_meta_id(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext(current_provider_id="")
+    client = module.AstrBotLLMClient(context, "umo-1")
+
+    result = await client.generate(system_prompt="system", prompt="prompt")
+
+    assert result == FakeResponse.completion_text
+    assert context.current_umo == "umo-1"
+    assert context.fallback_arg is None
+    assert context.llm_calls == [
+        {
+            "chat_provider_id": "provider-fallback",
+            "system_prompt": "system",
+            "prompt": "prompt",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_group_request_handler_uses_raw_request_event_and_platform_id(
     monkeypatch,
 ):
@@ -289,3 +321,36 @@ async def test_group_request_handler_uses_raw_request_event_and_platform_id(
             "platform_id": "napcat-1",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_notifier_logs_warning_when_send_admin_notice_fails(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    warnings = []
+
+    class StubLogger:
+        def warning(self, msg, *args, **kwargs):
+            warnings.append((msg, kwargs.get("exc_info")))
+
+    async def failing_send_admin_notice(*args, **kwargs):
+        raise RuntimeError("send failed")
+
+    monkeypatch.setattr(module, "logger", StubLogger())
+    monkeypatch.setattr(module, "send_admin_notice", failing_send_admin_notice)
+    notifier = module.RuntimeNotifier(FakeContext())
+
+    await notifier.notify(
+        group_config={"admin_qq_ids": ["10001"]},
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="答案",
+            flag="flag-1",
+            sub_type="add",
+        ),
+        title="加群审核通过",
+        action="approve",
+        reason="符合",
+    )
+
+    assert warnings == [("failed to send audit notification", True)]
