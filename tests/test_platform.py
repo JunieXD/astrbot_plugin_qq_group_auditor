@@ -121,6 +121,24 @@ def test_extract_join_request_ignores_invite_group_request():
     assert extract_join_request(event) is None
 
 
+@pytest.mark.parametrize("raw_sub_type", [None, ""])
+def test_extract_join_request_raises_for_missing_sub_type(raw_sub_type):
+    raw_event = {
+        "post_type": "request",
+        "request_type": "group",
+        "group_id": 123456,
+        "user_id": 10001,
+        "comment": "AutoEmailSender",
+        "flag": "flag-1",
+    }
+    if raw_sub_type is not None:
+        raw_event["sub_type"] = raw_sub_type
+    event = FakeEvent(RawEvent(raw_event))
+
+    with pytest.raises(ValueError, match="missing required group request fields"):
+        extract_join_request(event)
+
+
 def test_extract_join_request_raises_for_missing_required_fields():
     event = FakeEvent(
         RawEvent(

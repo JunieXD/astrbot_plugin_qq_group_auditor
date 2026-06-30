@@ -23,17 +23,17 @@ def extract_join_request(event: Any) -> JoinRequest | None:
     if _raw_get(raw, "post_type") != "request" or _raw_get(raw, "request_type") != "group":
         return None
 
-    sub_type = str(_raw_get(raw, "sub_type") or "add").strip() or "add"
-    if sub_type != "add":
-        return None
-
     group_id = str(_raw_get(raw, "group_id") or "").strip()
     user_id = str(_raw_get(raw, "user_id") or "").strip()
     flag = str(_raw_get(raw, "flag") or "").strip()
+    sub_type = str(_raw_get(raw, "sub_type") or "").strip()
     answer = str(_raw_get(raw, "comment") or "").strip()
 
-    if not group_id or not user_id or not flag:
+    if not group_id or not user_id or not flag or not sub_type:
         raise ValueError("missing required group request fields")
+
+    if sub_type != "add":
+        return None
 
     return JoinRequest(
         group_id=group_id,
