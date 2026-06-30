@@ -6,7 +6,7 @@ from qq_group_auditor.reviewer import LLMReviewError, ReviewLLMClient, review_an
 
 
 class FakeLLMClient(ReviewLLMClient):
-    def __init__(self, response_text: str | Exception) -> None:
+    def __init__(self, response_text: object | Exception) -> None:
         self.response_text = response_text
         self.calls: list[dict[str, str]] = []
 
@@ -70,6 +70,35 @@ async def test_review_answer_rejects_malformed_shape():
     client = FakeLLMClient('{"approve": "yes", "reason": 1}')
 
     with pytest.raises(LLMReviewError, match="malformed"):
+        await review_answer(
+            client,
+            group_id="123",
+            applicant_qq="10001",
+            answer="abc",
+            review_prompt="规则",
+        )
+
+
+@pytest.mark.parametrize("response_text", ["[]", '"approved"'])
+@pytest.mark.asyncio
+async def test_review_answer_rejects_non_object_json(response_text: str):
+    client = FakeLLMClient(response_text)
+
+    with pytest.raises(LLMReviewError, match="malformed"):
+        await review_answer(
+            client,
+            group_id="123",
+            applicant_qq="10001",
+            answer="abc",
+            review_prompt="规则",
+        )
+
+
+@pytest.mark.asyncio
+async def test_review_answer_rejects_non_string_response():
+    client = FakeLLMClient(None)
+
+    with pytest.raises(LLMReviewError, match="invalid json"):
         await review_answer(
             client,
             group_id="123",

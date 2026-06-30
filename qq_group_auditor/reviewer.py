@@ -40,6 +40,9 @@ def build_review_prompt(
 
 
 def parse_review_response(response_text: str) -> ReviewDecision:
+    if not isinstance(response_text, str):
+        raise LLMReviewError("invalid json response")
+
     try:
         payload = json.loads(response_text)
     except json.JSONDecodeError as exc:
