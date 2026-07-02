@@ -415,6 +415,31 @@ async def test_group_request_handler_uses_raw_request_event_and_platform_id(
 
 
 @pytest.mark.asyncio
+async def test_group_request_handler_uses_event_platform_id_for_admin_notice(
+    monkeypatch,
+):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0]["notify_on_approve"] = True
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    notice_platforms = []
+
+    async def fake_set_group_request(*args, **kwargs):
+        return None
+
+    async def fake_send_admin_notice(context_arg, admin_qq_ids, text, platform_name="aiocqhttp"):
+        notice_platforms.append(platform_name)
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module, "send_admin_notice", fake_send_admin_notice)
+
+    await plugin.handle_group_request(FakeRequestEvent())
+
+    assert notice_platforms == ["napcat-1"]
+
+
+@pytest.mark.asyncio
 async def test_group_request_handler_uses_event_unified_msg_origin_for_provider(
     monkeypatch,
 ):

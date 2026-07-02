@@ -104,8 +104,9 @@ class RuntimePlatform:
 
 
 class RuntimeNotifier:
-    def __init__(self, context: Context) -> None:
+    def __init__(self, context: Context, platform_id: str | None = None) -> None:
         self.context = context
+        self.platform_id = platform_id
 
     async def notify(
         self,
@@ -123,6 +124,7 @@ class RuntimeNotifier:
                 self.context,
                 list(group_config.get("admin_qq_ids") or []),
                 text,
+                platform_name=self.platform_id or "aiocqhttp",
             )
         except Exception:
             logger.warning("failed to send audit notification", exc_info=True)
@@ -164,7 +166,7 @@ def _platform_id(event: Any) -> str | None:
     return str(value) if value is not None else None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.1.0")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.1.1")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -186,10 +188,11 @@ class QQGroupAuditorPlugin(Star):
         if group_config is None:
             return
 
+        platform_id = _platform_id(event)
         service = AuditService(
             RuntimeReviewer(self.context, getattr(event, "unified_msg_origin", None)),
-            RuntimePlatform(self.context, platform_id=_platform_id(event)),
-            RuntimeNotifier(self.context),
+            RuntimePlatform(self.context, platform_id=platform_id),
+            RuntimeNotifier(self.context, platform_id=platform_id),
             logger=logger,
         )
         await service.handle_request(group_config, request)

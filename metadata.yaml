@@ -1,7 +1,7 @@
 name: astrbot_plugin_qq_group_auditor
 desc: QQ 加群申请 LLM 自动审核插件，按群配置审核提示词并通过 OneBot/NapCat 处理加群请求。
 help: 私聊使用 /qgaudit test <群号> <申请答案> 测试某个群的审核规则。
-version: v0.1.0
+version: v0.1.1
 author: JunieXD
 repo: ""
 display_name: QQ 加群审核

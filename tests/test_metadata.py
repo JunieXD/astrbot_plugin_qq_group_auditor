@@ -12,7 +12,7 @@ def test_metadata_has_required_astrbot_fields():
     metadata = yaml.safe_load((ROOT / "metadata.yaml").read_text(encoding="utf-8"))
 
     assert metadata["name"] == "astrbot_plugin_qq_group_auditor"
-    assert metadata["version"] == "v0.1.0"
+    assert metadata["version"] == "v0.1.1"
     assert metadata["support_platforms"] == ["aiocqhttp"]
     assert metadata["astrbot_version"] == ">=4.16,<5"
     assert metadata["help"]
