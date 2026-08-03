@@ -42,6 +42,18 @@ LLM 输出格式必须是 JSON：
 - `reason` 必须是字符串。
 - `approve=false`、JSON 解析失败、字段类型不正确，都不会自动通过。
 
+### DeepSeek JSON Output
+
+当前聊天 provider 来自 DeepSeek 官方 API 时，插件会按照 [DeepSeek JSON Output 文档](https://api-docs.deepseek.com/guides/json_mode) 传入：
+
+```json
+{"response_format": {"type": "json_object"}, "max_tokens": 512}
+```
+
+审核提示词同时包含 `json` 关键字和目标格式示例。若模型仍返回空内容、无效 JSON 或错误字段结构，插件会追加格式纠正指令并重试一次。完整包裹返回内容的 `json` Markdown 代码块也可以解析；任意解释文字与 JSON 混合的响应仍会拒绝解析。
+
+每次无法解析的原始返回都会以转义形式写入 warning 日志，最多保留前 500 个字符，便于定位空响应、代码块或额外说明文字，同时避免超长模型输出刷满日志。
+
 ## 不通过动作
 
 当申请答案未通过审核时，插件按该群的 `failure_action` 处理：

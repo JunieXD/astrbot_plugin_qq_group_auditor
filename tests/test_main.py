@@ -229,6 +229,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.1.2"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -369,6 +370,44 @@ async def test_llm_client_falls_back_when_current_provider_lookup_raises(monkeyp
         {
             "chat_provider_id": "provider-fallback",
             "system_prompt": "system",
+            "prompt": "prompt",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_enables_native_json_output_for_deepseek(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext(current_provider_id="deepseek/deepseek-v4-flash")
+    client = module.AstrBotLLMClient(context, "umo-1")
+
+    result = await client.generate(system_prompt="system json", prompt="prompt")
+
+    assert result == FakeResponse.completion_text
+    assert context.llm_calls == [
+        {
+            "chat_provider_id": "deepseek/deepseek-v4-flash",
+            "system_prompt": "system json",
+            "prompt": "prompt",
+            "response_format": {"type": "json_object"},
+            "max_tokens": 512,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_client_does_not_send_deepseek_api_options_to_other_sources(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    provider_id = "siliconflow/deepseek-ai/DeepSeek-V3"
+    context = FakeContext(current_provider_id=provider_id)
+    client = module.AstrBotLLMClient(context, "umo-1")
+
+    await client.generate(system_prompt="system json", prompt="prompt")
+
+    assert context.llm_calls == [
+        {
+            "chat_provider_id": provider_id,
+            "system_prompt": "system json",
             "prompt": "prompt",
         }
     ]

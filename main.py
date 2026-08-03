@@ -25,6 +25,13 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
 
 logger = logging.getLogger(__name__)
 
+_DEEPSEEK_JSON_MAX_TOKENS = 512
+
+
+def _is_deepseek_provider_id(provider_id: Any) -> bool:
+    source_id = str(provider_id).strip().lower().partition("/")[0]
+    return source_id == "deepseek" or source_id.startswith("deepseek-")
+
 
 @filter.command_group("qgaudit")
 def qgaudit():
@@ -38,10 +45,17 @@ class AstrBotLLMClient:
 
     async def generate(self, *, system_prompt: str, prompt: str) -> str:
         chat_provider_id = await self._provider_id()
+        generation_options: dict[str, Any] = {}
+        if _is_deepseek_provider_id(chat_provider_id):
+            generation_options = {
+                "response_format": {"type": "json_object"},
+                "max_tokens": _DEEPSEEK_JSON_MAX_TOKENS,
+            }
         response = await self.context.llm_generate(
             chat_provider_id=chat_provider_id,
             system_prompt=system_prompt,
             prompt=prompt,
+            **generation_options,
         )
         return str(getattr(response, "completion_text", ""))
 
@@ -166,7 +180,7 @@ def _platform_id(event: Any) -> str | None:
     return str(value) if value is not None else None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.1.1")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.1.2")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)

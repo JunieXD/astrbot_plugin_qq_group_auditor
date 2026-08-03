@@ -18,3 +18,6 @@ def test_readme_documents_required_user_flows():
     assert "空答案" in text
     assert "ignore" in text
     assert "reject" in text
+    assert "response_format" in text
+    assert "重试一次" in text
+    assert "500 个字符" in text
