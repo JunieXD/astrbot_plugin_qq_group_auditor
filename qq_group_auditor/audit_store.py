@@ -110,16 +110,27 @@ class AuditStore:
             completed_at INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS application_card_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',
+            attempted_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_applications_lookup
             ON applications(platform_id, group_id, applicant_qq, requested_at DESC);
         CREATE INDEX IF NOT EXISTS idx_actions_application
             ON application_actions(application_id, occurred_at, id);
         CREATE INDEX IF NOT EXISTS idx_memberships_lookup
             ON membership_sessions(platform_id, group_id, user_id, joined_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_card_attempts_application
+            ON application_card_attempts(application_id, source, attempted_at DESC);
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
-            self._connection.execute("PRAGMA user_version = 1")
+            self._connection.execute("PRAGMA user_version = 2")
 
     def close(self) -> None:
         with self._lock:
@@ -532,7 +543,12 @@ class AuditStore:
                            SELECT ms.joined_at FROM membership_sessions ms
                            WHERE ms.application_id = a.id AND ms.left_at IS NULL
                            ORDER BY ms.joined_at DESC, ms.id DESC LIMIT 1
-                       ) AS membership_joined_at
+                       ) AS membership_joined_at,
+                       (
+                           SELECT ms.card_at_join FROM membership_sessions ms
+                           WHERE ms.application_id = a.id AND ms.left_at IS NULL
+                           ORDER BY ms.joined_at DESC, ms.id DESC LIMIT 1
+                       ) AS membership_card_at_join
                 FROM applications a WHERE a.id = ?
                 """,
                 (application_id,),
@@ -546,6 +562,7 @@ class AuditStore:
         group_ids: list[str],
         now: int,
         limit: int = 100,
+        max_card_attempts: int = 5,
     ) -> list[dict[str, Any]]:
         if not group_ids:
             return []
@@ -583,10 +600,22 @@ class AuditStore:
                     AND aa.action = 'reject'
                     AND aa.status IN ('succeeded', 'inferred')
               )
+              AND (
+                  SELECT COUNT(*) FROM application_card_attempts attempts
+                  WHERE attempts.application_id = a.id
+                    AND attempts.source = 'member_reconcile_direct'
+              ) < ?
             ORDER BY a.requested_at DESC, a.id DESC LIMIT ?
         """
         params: list[Any] = [platform_id, *group_ids]
-        params.extend((now - PENDING_JOIN_RECONCILE_WINDOW_SECONDS, now + 60, limit))
+        params.extend(
+            (
+                now - PENDING_JOIN_RECONCILE_WINDOW_SECONDS,
+                now + 60,
+                max_card_attempts,
+                limit,
+            )
+        )
         with self._lock:
             rows = self._connection.execute(sql, params).fetchall()
             applications = [
@@ -797,6 +826,49 @@ class AuditStore:
                 "UPDATE applications SET nickname = ? WHERE id = ? AND nickname = ''",
                 (nickname, application_id),
             )
+
+    def record_card_attempt(
+        self,
+        *,
+        application_id: int,
+        source: str,
+        status: str,
+        error: str = "",
+        attempted_at: int | None = None,
+    ) -> int:
+        attempted_at = attempted_at or int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO application_card_attempts (
+                    application_id, source, status, error, attempted_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (application_id, source, status, error, attempted_at),
+            )
+        return int(cursor.lastrowid)
+
+    def card_attempt_count(self, *, application_id: int, source: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS count FROM application_card_attempts
+                WHERE application_id = ? AND source = ?
+                """,
+                (application_id, source),
+            ).fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    def has_successful_card_attempt(self, application_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM application_card_attempts
+                WHERE application_id = ? AND status = 'succeeded' LIMIT 1
+                """,
+                (application_id,),
+            ).fetchone()
+        return row is not None
 
     def record_leave(
         self,
@@ -1055,6 +1127,16 @@ class AuditStore:
                 """
                 SELECT * FROM application_actions
                 WHERE application_id = ? ORDER BY occurred_at, id
+                """,
+                (row["id"],),
+            ).fetchall()
+        ]
+        application["card_attempts"] = [
+            dict(item)
+            for item in self._connection.execute(
+                """
+                SELECT * FROM application_card_attempts
+                WHERE application_id = ? ORDER BY attempted_at, id
                 """,
                 (row["id"],),
             ).fetchall()

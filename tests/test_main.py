@@ -122,6 +122,7 @@ def install_astrbot_stub(monkeypatch: pytest.MonkeyPatch):
 def import_main(monkeypatch: pytest.MonkeyPatch):
     command_groups = install_astrbot_stub(monkeypatch)
     module = importlib.import_module("main")
+    module._CARD_ACTION_DELAY_RANGE_SECONDS = (0.0, 0.0)
     return module, command_groups
 
 
@@ -237,7 +238,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.3"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.4"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -1006,3 +1007,237 @@ async def test_reconcile_confirms_external_approval_before_inferring_rejection(m
     assert cards[0]["card"] == "2028"
     assert any(action["action"] == "approve" for action in platform_actions)
     assert not any(action["action"] == "reject" for action in platform_actions)
+
+
+def test_card_action_delay_uses_configured_random_range(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    module._CARD_ACTION_DELAY_RANGE_SECONDS = (1.25, 2.75)
+    arguments = []
+
+    def fake_uniform(lower, upper):
+        arguments.append((lower, upper))
+        return 1.8
+
+    monkeypatch.setattr(module.random, "uniform", fake_uniform)
+
+    assert module._card_action_delay_seconds() == 1.8
+    assert arguments == [(1.25, 2.75)]
+
+
+@pytest.mark.asyncio
+async def test_direct_card_update_waits_before_calling_platform(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="2028",
+            flag="paced-update",
+            sub_type="add",
+            requested_at=1900,
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    events = []
+
+    async def fake_sleep(delay):
+        events.append(("sleep", delay))
+
+    async def fake_set_group_card(*args, **kwargs):
+        events.append(("set", kwargs["user_id"]))
+
+    monkeypatch.setattr(module, "_card_action_delay_seconds", lambda: 1.6)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+
+    result = await plugin._reconcile_application_member(application_id)
+
+    assert result == "succeeded"
+    assert events == [("sleep", 1.6), ("set", "20002")]
+
+
+@pytest.mark.asyncio
+async def test_automatic_card_update_stops_at_retry_limit(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="2028",
+            flag="retry-limit",
+            sub_type="add",
+            requested_at=1900,
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    platform_calls = 0
+
+    async def always_fail(*args, **kwargs):
+        nonlocal platform_calls
+        platform_calls += 1
+        raise module.PlatformActionError("temporary failure")
+
+    monkeypatch.setattr(module, "set_group_card", always_fail)
+    results = [
+        await plugin._reconcile_application_member(application_id)
+        for _ in range(module._MAX_AUTOMATIC_CARD_ATTEMPTS + 1)
+    ]
+
+    assert results == ["failed"] * 5 + ["retry_exhausted"]
+    assert platform_calls == 5
+    assert plugin.audit_store.card_attempt_count(
+        application_id=application_id,
+        source="member_reconcile_direct",
+    ) == 5
+
+
+@pytest.mark.asyncio
+async def test_backfill_preserves_known_existing_card(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="2028",
+            flag="existing-card",
+            sub_type="add",
+            requested_at=1900,
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    plugin.audit_store.record_join(
+        platform_id="napcat-1",
+        event=module.GroupMemberIncrease(
+            group_id="123",
+            user_id="20002",
+            operator_id="30001",
+            sub_type="approve",
+            occurred_at=1910,
+            self_id="99999",
+        ),
+        old_card="本人设置的名片",
+    )
+    platform_calls = []
+
+    async def fake_set_group_card(*args, **kwargs):
+        platform_calls.append(kwargs)
+
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+
+    counts = await plugin._backfill_group_cards(
+        platform_id="napcat-1",
+        group_config=module.find_group_config(plugin.config, "123"),
+    )
+
+    assert counts["existing_card"] == 1
+    assert platform_calls == []
+    detail = plugin.audit_store.detail(group_id="123", application_id=application_id)
+    operation = detail["memberships"][0]["card_operations"][0]
+    assert operation["status"] == "skipped"
+    assert operation["old_card"] == "本人设置的名片"
+
+
+@pytest.mark.asyncio
+async def test_backfill_continues_after_unexpected_member_failure(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_ids = []
+    for index, user_id in enumerate(("20001", "20002"), start=1):
+        application_id, _ = plugin.audit_store.record_application(
+            platform_id="napcat-1",
+            request=module.JoinRequest(
+                group_id="123",
+                applicant_qq=user_id,
+                answer=f"202{index}",
+                flag=f"isolated-{index}",
+                sub_type="add",
+                requested_at=1900 + index,
+            ),
+            question="毕业年份",
+            question_source="config",
+            review_prompt="规则",
+        )
+        plugin.audit_store.record_action(
+            application_id=application_id,
+            kind="platform",
+            action="approve",
+            actor_qq="99999",
+            source="plugin",
+            status="succeeded",
+            occurred_at=1910 + index,
+        )
+        application_ids.append(application_id)
+    visited = []
+
+    async def isolated_update(**kwargs):
+        application_id = int(kwargs["application"]["id"])
+        visited.append(application_id)
+        if application_id == application_ids[0]:
+            raise RuntimeError("unexpected failure")
+        return "succeeded"
+
+    monkeypatch.setattr(plugin, "_set_card_from_application", isolated_update)
+
+    counts = await plugin._backfill_group_cards(
+        platform_id="napcat-1",
+        group_config=module.find_group_config(plugin.config, "123"),
+    )
+
+    assert visited == application_ids
+    assert counts["failed"] == 1
+    assert counts["succeeded"] == 1

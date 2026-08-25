@@ -86,6 +86,16 @@ def format_detail(record: dict[str, Any] | None) -> str:
         )
         if action.get("reason"):
             lines.append(f"  原因：{action.get('reason')}")
+    card_attempts = record.get("card_attempts") or []
+    if card_attempts:
+        lines.append("群名片尝试：")
+    for attempt in card_attempts:
+        lines.append(
+            f"- {format_time(attempt.get('attempted_at'))} "
+            f"来源={attempt.get('source')} 状态={attempt.get('status')}"
+        )
+        if attempt.get("error"):
+            lines.append(f"  错误：{attempt.get('error')}")
     memberships = record.get("memberships") or []
     for index, membership in enumerate(memberships, start=1):
         lines.append(f"成员会话 {index}：")

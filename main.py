@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import re
 import time
 from dataclasses import replace
@@ -82,7 +83,8 @@ _DEEPSEEK_JSON_MAX_TOKENS = 512
 _EXTERNAL_REJECTION_GRACE_SECONDS = 120
 _RECONCILE_INTERVAL_SECONDS = 60
 _JOIN_CONFIRM_RETRY_DELAYS = (1, 3, 8, 20)
-_BACKFILL_ACTION_DELAY_SECONDS = 0.2
+_CARD_ACTION_DELAY_RANGE_SECONDS = (0.8, 2.2)
+_MAX_AUTOMATIC_CARD_ATTEMPTS = 5
 _PLUGIN_NAME = "astrbot_plugin_qq_group_auditor"
 
 
@@ -98,6 +100,10 @@ def _is_missing_group_member_error(error: Exception) -> bool:
         or "member not found" in message
         or "not in group" in message
     )
+
+
+def _card_action_delay_seconds() -> float:
+    return random.uniform(*_CARD_ACTION_DELAY_RANGE_SECONDS)
 
 
 @filter.command_group("qgaudit")
@@ -293,7 +299,7 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.3")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.4")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -302,6 +308,7 @@ class QQGroupAuditorPlugin(Star):
         self._reconcile_task: asyncio.Task[None] | None = None
         self._application_tasks: dict[int, asyncio.Task[None]] = {}
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._card_attempt_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
         try:
             self.audit_store: AuditStore | None = AuditStore(_audit_database_path())
@@ -671,7 +678,10 @@ class QQGroupAuditorPlugin(Star):
                 error = str(exc)
                 status = "skipped"
                 result = "skipped"
-        if not error and preapplied_card:
+        if not error and member_info.card and not preapplied_card:
+            status = "skipped"
+            result = "existing_card"
+        elif not error and preapplied_card:
             if target_card != preapplied_card:
                 error = "群名片模板在设置过程中发生变化"
                 status = "failed"
@@ -685,6 +695,7 @@ class QQGroupAuditorPlugin(Star):
                 result = "already_target"
             else:
                 try:
+                    await asyncio.sleep(_card_action_delay_seconds())
                     await set_group_card(
                         self.context,
                         group_id=increase.group_id,
@@ -729,15 +740,59 @@ class QQGroupAuditorPlugin(Star):
         action_source: str,
         notify_error: bool,
     ) -> str:
+        group_id = str(application.get("group_id") or "")
+        user_id = str(application.get("applicant_qq") or "")
+        platform_id = str(application.get("platform_id") or "aiocqhttp")
+        lock_key = (platform_id, group_id, user_id)
+        lock = self._card_attempt_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            return await self._set_card_from_application_locked(
+                group_config=group_config,
+                application=application,
+                action_source=action_source,
+                notify_error=notify_error,
+            )
+
+    async def _set_card_from_application_locked(
+        self,
+        *,
+        group_config: dict[str, Any],
+        application: dict[str, Any],
+        action_source: str,
+        notify_error: bool,
+    ) -> str:
         assert self.audit_store is not None
         group_id = str(application.get("group_id") or "")
         user_id = str(application.get("applicant_qq") or "")
         platform_id = str(application.get("platform_id") or "aiocqhttp")
+        application_id = int(application["id"])
+        if self.audit_store.has_successful_card_attempt(application_id):
+            return "already_done"
+        if (
+            action_source == "member_reconcile_direct"
+            and self.audit_store.card_attempt_count(
+                application_id=application_id,
+                source=action_source,
+            )
+            >= _MAX_AUTOMATIC_CARD_ATTEMPTS
+        ):
+            return "retry_exhausted"
         membership_id = application.get("membership_id")
         if membership_id is not None and self.audit_store.has_successful_card_operation(
             int(membership_id)
         ):
             return "already_done"
+        known_card = str(application.get("membership_card_at_join") or "").strip()
+        if membership_id is not None and known_card:
+            self.audit_store.record_card_operation(
+                membership_id=int(membership_id),
+                template=str(group_config.get("card_template") or "{nickname}"),
+                old_card=known_card,
+                target_card="",
+                status="skipped",
+                error="成员已有群名片，未修改",
+            )
+            return "existing_card"
 
         occurred_at = int(
             application.get("membership_joined_at")
@@ -806,6 +861,7 @@ class QQGroupAuditorPlugin(Star):
             return "skipped"
 
         try:
+            await asyncio.sleep(_card_action_delay_seconds())
             await set_group_card(
                 self.context,
                 group_id=group_id,
@@ -815,12 +871,24 @@ class QQGroupAuditorPlugin(Star):
             )
         except PlatformActionError as exc:
             if _is_missing_group_member_error(exc):
+                self._record_application_card_attempt(
+                    application_id=application_id,
+                    source=action_source,
+                    status="not_in_group",
+                    error=str(exc),
+                )
                 logger.debug(
                     "group member is not present yet: group=%s user=%s",
                     group_id,
                     user_id,
                 )
                 return "not_in_group"
+            self._record_application_card_attempt(
+                application_id=application_id,
+                source=action_source,
+                status="failed",
+                error=str(exc),
+            )
             logger.info(
                 "direct group card update failed: group=%s user=%s error=%s",
                 group_id,
@@ -837,6 +905,12 @@ class QQGroupAuditorPlugin(Star):
                 )
             return "failed"
 
+        self._record_application_card_attempt(
+            application_id=application_id,
+            source=action_source,
+            status="succeeded",
+        )
+
         return await self._process_member_increase(
             group_config=group_config,
             increase=increase,
@@ -848,6 +922,26 @@ class QQGroupAuditorPlugin(Star):
             notify_error=notify_error,
             preapplied_card=target_card,
         )
+
+    def _record_application_card_attempt(
+        self,
+        *,
+        application_id: int,
+        source: str,
+        status: str,
+        error: str = "",
+    ) -> None:
+        if self.audit_store is None:
+            return
+        try:
+            self.audit_store.record_card_attempt(
+                application_id=application_id,
+                source=source,
+                status=status,
+                error=error,
+            )
+        except Exception:
+            logger.exception("failed to persist group card attempt")
 
     async def _notify_card_error(
         self,
@@ -937,12 +1031,19 @@ class QQGroupAuditorPlugin(Star):
             platform_id=platform_id,
             group_ids=group_ids,
             now=now,
+            max_card_attempts=_MAX_AUTOMATIC_CARD_ATTEMPTS,
         )
         for application in applications:
-            await self._reconcile_application_member(
-                int(application["id"]),
-                application=application,
-            )
+            try:
+                await self._reconcile_application_member(
+                    int(application["id"]),
+                    application=application,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to reconcile one approved applicant: application=%s",
+                    application.get("id"),
+                )
 
     async def _backfill_group_cards(
         self,
@@ -965,20 +1066,26 @@ class QQGroupAuditorPlugin(Star):
             "unmatched": len(recorded_user_ids) - len(applications),
             "succeeded": 0,
             "already_done": 0,
+            "existing_card": 0,
             "skipped": 0,
             "not_in_group": 0,
             "failed": 0,
         }
-        for index, application in enumerate(applications):
-            result = await self._set_card_from_application(
-                group_config=group_config,
-                application=application,
-                action_source="card_backfill_direct",
-                notify_error=False,
-            )
+        for application in applications:
+            try:
+                result = await self._set_card_from_application(
+                    group_config=group_config,
+                    application=application,
+                    action_source="card_backfill_direct",
+                    notify_error=False,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to backfill one group member card: application=%s",
+                    application.get("id"),
+                )
+                result = "failed"
             counts[result if result in counts else "failed"] += 1
-            if index + 1 < len(applications):
-                await asyncio.sleep(_BACKFILL_ACTION_DELAY_SECONDS)
         return counts
 
     async def _reconcile_loop(self) -> None:
@@ -1139,6 +1246,7 @@ class QQGroupAuditorPlugin(Star):
             f"有审计记录的QQ：{counts['recorded']}\n"
             f"本次修改成功：{counts['succeeded']}\n"
             f"此前已经处理：{counts['already_done']}\n"
+            f"已有群名片，未修改：{counts['existing_card']}\n"
             f"因模板或平台标记不可修改而跳过：{counts['skipped']}\n"
             f"当前不在群内：{counts['not_in_group']}\n"
             f"其他设置失败：{counts['failed']}\n"

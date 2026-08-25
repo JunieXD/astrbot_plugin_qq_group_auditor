@@ -402,3 +402,54 @@ def test_pending_join_reconciliation_uses_recent_approval_and_expires(tmp_path):
     assert [item["id"] for item in recent] == [application_id]
     assert expired == []
     store.close()
+
+
+def test_pending_join_reconciliation_stops_after_persisted_attempt_limit(tmp_path):
+    database = tmp_path / "audit.sqlite3"
+    store = AuditStore(database)
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("retry-limit", 10_000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=10_001,
+    )
+
+    for index in range(5):
+        store.record_card_attempt(
+            application_id=application_id,
+            source="member_reconcile_direct",
+            status="not_in_group",
+            error=f"第 {index + 1} 次失败",
+            attempted_at=10_002 + index,
+        )
+
+    detail = store.detail(group_id="123", application_id=application_id)
+    assert store.card_attempt_count(
+        application_id=application_id,
+        source="member_reconcile_direct",
+    ) == 5
+    assert len(detail["card_attempts"]) == 5
+    assert store.pending_join_applications(
+        platform_id="napcat-1",
+        group_ids=["123"],
+        now=10_006,
+        max_card_attempts=5,
+    ) == []
+    store.close()
+
+    reopened = AuditStore(database)
+    assert reopened.card_attempt_count(
+        application_id=application_id,
+        source="member_reconcile_direct",
+    ) == 5
+    reopened.close()
