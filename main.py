@@ -24,6 +24,7 @@ try:
         normalize_config,
     )
     from .qq_group_auditor.models import (
+        ActionResult,
         GroupMemberIncrease,
         GroupMemberInfo,
         JoinRequest,
@@ -38,6 +39,7 @@ try:
         get_group_question,
         get_group_system_requests,
         get_user_nickname,
+        onebot_platform_ids,
         set_group_card,
         set_group_request,
     )
@@ -55,6 +57,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
         normalize_config,
     )
     from qq_group_auditor.models import (
+        ActionResult,
         GroupMemberIncrease,
         GroupMemberInfo,
         JoinRequest,
@@ -69,6 +72,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
         get_group_question,
         get_group_system_requests,
         get_user_nickname,
+        onebot_platform_ids,
         set_group_card,
         set_group_request,
     )
@@ -84,7 +88,9 @@ _EXTERNAL_REJECTION_GRACE_SECONDS = 120
 _RECONCILE_INTERVAL_SECONDS = 60
 _JOIN_CONFIRM_RETRY_DELAYS = (1, 3, 8, 20)
 _CARD_ACTION_DELAY_RANGE_SECONDS = (0.8, 2.2)
+_CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (2.0, 5.0)
 _MAX_AUTOMATIC_CARD_ATTEMPTS = 5
+_MAX_CATCH_UP_REVIEWS_PER_CYCLE = 10
 _PLUGIN_NAME = "astrbot_plugin_qq_group_auditor"
 
 
@@ -104,6 +110,19 @@ def _is_missing_group_member_error(error: Exception) -> bool:
 
 def _card_action_delay_seconds() -> float:
     return random.uniform(*_CARD_ACTION_DELAY_RANGE_SECONDS)
+
+
+def _catch_up_action_delay_seconds() -> float:
+    return random.uniform(*_CATCH_UP_ACTION_DELAY_RANGE_SECONDS)
+
+
+def _system_request_is_checked(item: dict[str, Any]) -> bool:
+    value = item.get("checked")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
 
 
 @filter.command_group("qgaudit")
@@ -169,9 +188,15 @@ class RuntimeReviewer:
 
 
 class RuntimePlatform:
-    def __init__(self, context: Context, platform_id: str | None = None) -> None:
+    def __init__(
+        self,
+        context: Context,
+        platform_id: str | None = None,
+        action_delay_seconds: float = 0.0,
+    ) -> None:
         self.context = context
         self.platform_id = platform_id
+        self.action_delay_seconds = max(float(action_delay_seconds), 0.0)
 
     async def set_group_request(
         self,
@@ -180,6 +205,8 @@ class RuntimePlatform:
         approve: bool,
         reason: str,
     ) -> None:
+        if self.action_delay_seconds > 0:
+            await asyncio.sleep(self.action_delay_seconds)
         await set_group_request(
             self.context,
             flag=request.flag,
@@ -299,7 +326,7 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.4")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.5")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -307,6 +334,7 @@ class QQGroupAuditorPlugin(Star):
         self.config = normalize_config(dict(config or {}))
         self._reconcile_task: asyncio.Task[None] | None = None
         self._application_tasks: dict[int, asyncio.Task[None]] = {}
+        self._review_locks: dict[int, asyncio.Lock] = {}
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._card_attempt_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
@@ -370,27 +398,97 @@ class QQGroupAuditorPlugin(Star):
         if group_config is None:
             return
 
+        await self._review_application(
+            group_config=group_config,
+            request=request,
+            application_id=application_id,
+            platform_id=platform_id,
+            unified_msg_origin=getattr(event, "unified_msg_origin", None),
+            action_source="plugin",
+        )
+
+    async def _review_application(
+        self,
+        *,
+        group_config: dict[str, Any],
+        request: JoinRequest,
+        application_id: int | None,
+        platform_id: str | None,
+        unified_msg_origin: str | None,
+        action_source: str,
+    ) -> ActionResult | None:
+        if application_id is None:
+            return await self._run_application_review(
+                group_config=group_config,
+                request=request,
+                application_id=None,
+                platform_id=platform_id,
+                unified_msg_origin=unified_msg_origin,
+                action_source=action_source,
+            )
+        lock = self._review_locks.setdefault(application_id, asyncio.Lock())
+        async with lock:
+            if (
+                self.audit_store is None
+                or self.audit_store.has_review_action(application_id)
+            ):
+                return None
+            return await self._run_application_review(
+                group_config=group_config,
+                request=request,
+                application_id=application_id,
+                platform_id=platform_id,
+                unified_msg_origin=unified_msg_origin,
+                action_source=action_source,
+            )
+
+    async def _run_application_review(
+        self,
+        *,
+        group_config: dict[str, Any],
+        request: JoinRequest,
+        application_id: int | None,
+        platform_id: str | None,
+        unified_msg_origin: str | None,
+        action_source: str,
+    ) -> ActionResult:
+        action_delay_seconds = (
+            _catch_up_action_delay_seconds()
+            if action_source == "plugin_catch_up"
+            else 0.0
+        )
         service = AuditService(
-            RuntimeReviewer(self.context, getattr(event, "unified_msg_origin", None)),
-            RuntimePlatform(self.context, platform_id=platform_id),
+            RuntimeReviewer(self.context, unified_msg_origin),
+            RuntimePlatform(
+                self.context,
+                platform_id=platform_id,
+                action_delay_seconds=action_delay_seconds,
+            ),
             RuntimeNotifier(self.context, platform_id=platform_id),
             logger=logger,
         )
         result = await service.handle_request(group_config, request)
-        if application_id is not None:
-            try:
-                self._record_service_result(application_id, request, result)
-            except Exception:
-                logger.exception("failed to persist group review result")
-            else:
-                if (
-                    result.platform_action == "approve"
-                    and result.platform_status == "succeeded"
-                    and group_config.get("auto_set_card", False)
-                ):
-                    confirmed = await self._reconcile_application_member(application_id)
-                    if confirmed in {None, "failed", "not_in_group"}:
-                        self._schedule_application_reconciliation(application_id)
+        if application_id is None:
+            return result
+        try:
+            self._record_service_result(
+                application_id,
+                request,
+                result,
+                source=action_source,
+            )
+        except Exception:
+            logger.exception("failed to persist group review result")
+            return result
+        if (
+            result.platform_action == "approve"
+            and result.platform_status == "succeeded"
+            and group_config.get("auto_set_card", False)
+        ):
+            confirmed = await self._reconcile_application_member(application_id)
+            if confirmed in {None, "failed", "not_in_group"}:
+                self._schedule_application_reconciliation(application_id)
+        return result
 
     async def _persist_request(
         self,
@@ -447,7 +545,14 @@ class QQGroupAuditorPlugin(Star):
         )
         return request, application_id, self.audit_store.has_review_action(application_id)
 
-    def _record_service_result(self, application_id: int, request: JoinRequest, result: Any) -> None:
+    def _record_service_result(
+        self,
+        application_id: int,
+        request: JoinRequest,
+        result: Any,
+        *,
+        source: str = "plugin",
+    ) -> None:
         if self.audit_store is None:
             return
         if result.review_action:
@@ -456,7 +561,7 @@ class QQGroupAuditorPlugin(Star):
                 kind="review",
                 action=result.review_action,
                 actor_qq=request.self_id,
-                source="plugin",
+                source=source,
                 status="failed" if result.review_action == "error" else "completed",
                 reason=result.reason,
             )
@@ -466,7 +571,7 @@ class QQGroupAuditorPlugin(Star):
                 kind="platform",
                 action=result.platform_action,
                 actor_qq=request.self_id,
-                source="plugin",
+                source=source,
                 status=result.platform_status,
                 reason=result.reason,
             )
@@ -476,7 +581,7 @@ class QQGroupAuditorPlugin(Star):
                 kind="platform",
                 action="no_action",
                 actor_qq=request.self_id,
-                source="plugin",
+                source=source,
                 status="observed",
                 reason="配置为 ignore，未调用平台审批接口",
             )
@@ -1092,7 +1197,10 @@ class QQGroupAuditorPlugin(Star):
         while True:
             try:
                 if self.audit_store is not None:
-                    for platform_id in self.audit_store.platform_ids():
+                    platform_ids = onebot_platform_ids(self.context)
+                    if not platform_ids:
+                        platform_ids = self.audit_store.platform_ids()
+                    for platform_id in platform_ids:
                         await self._reconcile_platform(platform_id)
             except asyncio.CancelledError:
                 raise
@@ -1113,56 +1221,103 @@ class QQGroupAuditorPlugin(Star):
         except Exception:
             logger.warning("failed to load group system requests", exc_info=True)
             requests = []
+        catch_up_reviews = 0
         for item in requests:
-            group_id = str(item.get("group_id") or "").strip()
-            applicant_qq = str(
-                item.get("requester_uin")
-                or item.get("user_id")
-                or item.get("invitor_uin")
-                or ""
-            ).strip()
-            flag = str(item.get("request_id") or "").strip()
-            group_config = find_group_policy(self.config, group_id)
-            if not group_id or not applicant_qq or not flag or group_config is None:
-                continue
-            if not _tracks_requests(group_config):
-                continue
-            raw_comment = str(item.get("message") or item.get("comment") or "").strip()
-            request = JoinRequest(
-                group_id=group_id,
-                applicant_qq=applicant_qq,
-                answer=extract_application_answer(raw_comment),
-                flag=flag,
-                sub_type="add",
-                requested_at=_timestamp(
-                    item.get("request_time") or item.get("time"),
-                    now,
-                ),
-                nickname=str(item.get("requester_nick") or "").strip(),
-                raw_comment=raw_comment,
-            )
-            application_id, _ = self.audit_store.record_application(
-                platform_id=platform_id,
-                request=request,
-                question=str(group_config.get("application_question") or ""),
-                question_source=(
-                    "config" if group_config.get("application_question") else "unknown"
-                ),
-                review_prompt=str(group_config.get("review_prompt") or ""),
-                observed_at=now,
-            )
-            if item.get("checked"):
-                self.audit_store.mark_external_checked(
-                    application_id=application_id,
-                    actor_qq=str(item.get("actor") or "").strip(),
-                    observed_at=now,
+            try:
+                attempted = await self._reconcile_system_request(
+                    item=item,
+                    platform_id=platform_id,
+                    now=now,
+                    allow_catch_up=(
+                        catch_up_reviews < _MAX_CATCH_UP_REVIEWS_PER_CYCLE
+                    ),
                 )
+            except Exception:
+                logger.exception("failed to reconcile one group system request")
+                continue
+            catch_up_reviews += int(attempted)
         await self._reconcile_missing_joins(platform_id, now)
         self.audit_store.infer_external_rejections(
             platform_id=platform_id,
             now=now,
             grace_seconds=_EXTERNAL_REJECTION_GRACE_SECONDS,
         )
+
+    async def _reconcile_system_request(
+        self,
+        *,
+        item: dict[str, Any],
+        platform_id: str,
+        now: int,
+        allow_catch_up: bool,
+    ) -> bool:
+        assert self.audit_store is not None
+        group_id = str(item.get("group_id") or "").strip()
+        requester_qq = str(
+            item.get("requester_uin") or item.get("user_id") or ""
+        ).strip()
+        applicant_qq = requester_qq or str(item.get("invitor_uin") or "").strip()
+        flag = str(item.get("request_id") or "").strip()
+        group_config = find_group_policy(self.config, group_id)
+        if not group_id or not applicant_qq or not flag or group_config is None:
+            return False
+        if not _tracks_requests(group_config):
+            return False
+        raw_comment = str(item.get("message") or item.get("comment") or "").strip()
+        request = JoinRequest(
+            group_id=group_id,
+            applicant_qq=applicant_qq,
+            answer=extract_application_answer(raw_comment),
+            flag=flag,
+            sub_type="add",
+            requested_at=_timestamp(
+                item.get("request_time") or item.get("time"),
+                now,
+            ),
+            nickname=str(item.get("requester_nick") or "").strip(),
+            raw_comment=raw_comment,
+            self_id=str(item.get("self_id") or "").strip(),
+        )
+        application_id, _ = self.audit_store.record_application(
+            platform_id=platform_id,
+            request=request,
+            question=str(group_config.get("application_question") or ""),
+            question_source=(
+                "config" if group_config.get("application_question") else "unknown"
+            ),
+            review_prompt=str(group_config.get("review_prompt") or ""),
+            observed_at=now,
+        )
+        if _system_request_is_checked(item):
+            self.audit_store.mark_external_checked(
+                application_id=application_id,
+                actor_qq=str(item.get("actor") or "").strip(),
+                observed_at=now,
+            )
+            return False
+        enabled_group = find_group_config(self.config, group_id)
+        if (
+            not allow_catch_up
+            or not requester_qq
+            or enabled_group is None
+            or self.audit_store.has_review_action(application_id)
+        ):
+            return False
+        try:
+            await self._review_application(
+                group_config=enabled_group,
+                request=request,
+                application_id=application_id,
+                platform_id=platform_id,
+                unified_msg_origin=None,
+                action_source="plugin_catch_up",
+            )
+        except Exception:
+            logger.exception(
+                "failed to catch up one pending group request: application=%s",
+                application_id,
+            )
+        return True
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @qgaudit.command("test")

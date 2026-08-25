@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import sys
@@ -123,6 +124,7 @@ def import_main(monkeypatch: pytest.MonkeyPatch):
     command_groups = install_astrbot_stub(monkeypatch)
     module = importlib.import_module("main")
     module._CARD_ACTION_DELAY_RANGE_SECONDS = (0.0, 0.0)
+    module._CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (0.0, 0.0)
     return module, command_groups
 
 
@@ -238,7 +240,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.4"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.5"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -1022,6 +1024,318 @@ def test_card_action_delay_uses_configured_random_range(monkeypatch):
 
     assert module._card_action_delay_seconds() == 1.8
     assert arguments == [(1.25, 2.75)]
+
+
+def test_catch_up_action_delay_uses_configured_random_range(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    module._CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (2.0, 5.0)
+    arguments = []
+
+    def fake_uniform(lower, upper):
+        arguments.append((lower, upper))
+        return 3.4
+
+    monkeypatch.setattr(module.random, "uniform", fake_uniform)
+
+    assert module._catch_up_action_delay_seconds() == 3.4
+    assert arguments == [(2.0, 5.0)]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (False, False),
+        (True, True),
+        (0, False),
+        (1, True),
+        ("false", False),
+        ("true", True),
+        (None, False),
+    ],
+)
+def test_system_request_checked_normalization(monkeypatch, value, expected):
+    module, _ = import_main(monkeypatch)
+
+    assert module._system_request_is_checked({"checked": value}) is expected
+
+
+@pytest.mark.asyncio
+async def test_reconcile_catches_up_pending_request_once(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    platform_calls = []
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [
+            {
+                "request_id": 12345,
+                "group_id": 123,
+                "requester_uin": 20002,
+                "message": "问题：年级\n答案：24级",
+                "requester_nick": "申请人",
+                "request_time": 900,
+                "self_id": 99999,
+                "checked": False,
+            }
+        ]
+
+    async def fake_set_group_request(*args, **kwargs):
+        platform_calls.append(kwargs)
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+
+    await plugin._reconcile_platform("napcat-1")
+    await plugin._reconcile_platform("napcat-1")
+
+    assert len(context.llm_calls) == 1
+    assert platform_calls == [
+        {
+            "flag": "12345",
+            "sub_type": "add",
+            "approve": True,
+            "reason": "",
+            "platform_id": "napcat-1",
+        }
+    ]
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["answer"] == "24级"
+    assert {action["source"] for action in record["actions"]} == {
+        "plugin_catch_up"
+    }
+
+
+@pytest.mark.asyncio
+async def test_catch_up_waits_before_platform_approval(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    request = module.JoinRequest(
+        group_id="123",
+        applicant_qq="20002",
+        answer="关键词答案",
+        flag="paced-catch-up",
+        sub_type="add",
+        requested_at=900,
+    )
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=request,
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    events = []
+
+    async def fake_sleep(delay):
+        events.append(("sleep", delay))
+
+    async def fake_set_group_request(*args, **kwargs):
+        events.append(("approve", kwargs["flag"]))
+
+    monkeypatch.setattr(module, "_catch_up_action_delay_seconds", lambda: 3.2)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+
+    result = await plugin._review_application(
+        group_config=module.find_group_config(plugin.config, "123"),
+        request=request,
+        application_id=application_id,
+        platform_id="napcat-1",
+        unified_msg_origin=None,
+        action_source="plugin_catch_up",
+    )
+
+    assert result.platform_status == "succeeded"
+    assert events == [("sleep", 3.2), ("approve", "paced-catch-up")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["checked", "disabled", "invite"])
+async def test_reconcile_does_not_catch_up_ineligible_request(monkeypatch, case):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    if case == "disabled":
+        config["group_audits"][0]["enabled"] = False
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    item = {
+        "request_id": 12345,
+        "group_id": 123,
+        "message": "关键词答案",
+        "requester_nick": "申请人",
+        "request_time": 900,
+        "checked": case == "checked",
+    }
+    if case == "invite":
+        item["invitor_uin"] = 20002
+    else:
+        item["requester_uin"] = 20002
+    platform_calls = []
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [item]
+
+    async def fake_set_group_request(*args, **kwargs):
+        platform_calls.append(kwargs)
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+
+    await plugin._reconcile_platform("napcat-1")
+
+    assert context.llm_calls == []
+    assert platform_calls == []
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_limits_catch_up_batch_and_continues_next_cycle(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    module._MAX_CATCH_UP_REVIEWS_PER_CYCLE = 1
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    platform_flags = []
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [
+            {
+                "request_id": request_id,
+                "group_id": 123,
+                "requester_uin": user_id,
+                "message": "关键词答案",
+                "checked": False,
+            }
+            for request_id, user_id in ((111, 20001), (222, 20002))
+        ]
+
+    async def fake_set_group_request(*args, **kwargs):
+        platform_flags.append(kwargs["flag"])
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+
+    await plugin._reconcile_platform("napcat-1")
+    assert platform_flags == ["111"]
+
+    await plugin._reconcile_platform("napcat-1")
+    assert platform_flags == ["111", "222"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_isolates_unexpected_system_request_failure(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    visited = []
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [{"request_id": 111}, {"request_id": 222}]
+
+    async def fake_reconcile_system_request(**kwargs):
+        request_id = kwargs["item"]["request_id"]
+        visited.append(request_id)
+        if request_id == 111:
+            raise RuntimeError("broken item")
+        return False
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(
+        plugin,
+        "_reconcile_system_request",
+        fake_reconcile_system_request,
+    )
+
+    await plugin._reconcile_platform("napcat-1")
+
+    assert visited == [111, 222]
+
+
+@pytest.mark.asyncio
+async def test_realtime_and_catch_up_share_review_lock(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    request = module.JoinRequest(
+        group_id="123",
+        applicant_qq="20002",
+        answer="关键词答案",
+        flag="shared-lock",
+        sub_type="add",
+        requested_at=900,
+        self_id="99999",
+    )
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=request,
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    platform_calls = 0
+
+    async def delayed_set_group_request(*args, **kwargs):
+        nonlocal platform_calls
+        platform_calls += 1
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(module, "set_group_request", delayed_set_group_request)
+    first = asyncio.create_task(
+        plugin._review_application(
+            group_config=module.find_group_config(plugin.config, "123"),
+            request=request,
+            application_id=application_id,
+            platform_id="napcat-1",
+            unified_msg_origin="request-umo",
+            action_source="plugin",
+        )
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        plugin._review_application(
+            group_config=module.find_group_config(plugin.config, "123"),
+            request=request,
+            application_id=application_id,
+            platform_id="napcat-1",
+            unified_msg_origin=None,
+            action_source="plugin_catch_up",
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+
+    results = await asyncio.gather(first, second)
+
+    assert platform_calls == 1
+    assert len(context.llm_calls) == 1
+    assert results[0].platform_status == "succeeded"
+    assert results[1] is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_loop_discovers_active_platform_with_empty_database(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    assert plugin.audit_store.platform_ids() == []
+    visited = []
+
+    async def stop_after_first_platform(platform_id):
+        visited.append(platform_id)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(module, "onebot_platform_ids", lambda context: ["napcat-1"])
+    monkeypatch.setattr(plugin, "_reconcile_platform", stop_after_first_platform)
+
+    with pytest.raises(asyncio.CancelledError):
+        await plugin._reconcile_loop()
+
+    assert visited == ["napcat-1"]
 
 
 @pytest.mark.asyncio

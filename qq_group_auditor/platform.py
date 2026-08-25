@@ -145,6 +145,23 @@ def _platform_config_id(platform: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _is_aiocqhttp_platform(platform: Any) -> bool:
+    names: set[str] = set()
+    meta = getattr(platform, "meta", None)
+    if callable(meta):
+        try:
+            metadata = meta()
+        except Exception:
+            metadata = None
+        name = getattr(metadata, "name", None)
+        if name:
+            names.add(str(name).strip().lower())
+    config = getattr(platform, "config", None)
+    if isinstance(config, dict) and config.get("type"):
+        names.add(str(config["type"]).strip().lower())
+    return not names or "aiocqhttp" in names
+
+
 def _platform_matches_id(platform: Any, platform_id: str) -> bool:
     return platform_id in {
         value
@@ -166,6 +183,30 @@ def find_onebot_bot(context: Any, platform_id: str | None = None) -> Any:
         if bot is not None and hasattr(bot, "call_action"):
             return bot
     raise PlatformActionError("onebot bot api not found")
+
+
+def onebot_platform_ids(context: Any) -> list[str]:
+    platform_ids: list[str] = []
+    for platform in _iter_platforms(context):
+        bot = getattr(platform, "bot", None)
+        if (
+            bot is None
+            or not hasattr(bot, "call_action")
+            or not _is_aiocqhttp_platform(platform)
+        ):
+            continue
+        for resolver in (
+            _platform_meta_id,
+            _platform_metadata_id,
+            _platform_id,
+            _platform_config_id,
+        ):
+            platform_id = resolver(platform)
+            if platform_id:
+                if platform_id not in platform_ids:
+                    platform_ids.append(platform_id)
+                break
+    return platform_ids
 
 
 async def set_group_request(

@@ -13,6 +13,7 @@ from qq_group_auditor.platform import (
     get_group_question,
     get_group_system_requests,
     get_user_nickname,
+    onebot_platform_ids,
     set_group_card,
     set_group_request,
 )
@@ -56,17 +57,19 @@ class FakePlatform:
         platform_id: str | None = None,
         *,
         meta_id: str | None = None,
+        meta_name: str | None = None,
         metadata_id: str | None = None,
         config_id: str | None = None,
     ):
         self.bot = bot
         self.id = platform_id
         self._meta_id = meta_id
+        self._meta_name = meta_name
         self.metadata = type("Metadata", (), {"id": metadata_id})()
         self.config = {"id": config_id} if config_id is not None else {}
 
     def meta(self):
-        return type("Meta", (), {"id": self._meta_id})()
+        return type("Meta", (), {"id": self._meta_id, "name": self._meta_name})()
 
 
 class FakeContext:
@@ -109,6 +112,30 @@ def test_extract_join_request_from_onebot_add_request():
     assert request.requested_at == 1234567890
     assert request.self_id == "99999"
     assert request.raw_comment == "AutoEmailSender"
+
+
+def test_onebot_platform_ids_uses_first_stable_identifier():
+    bot = FakeBot()
+    context = FakeContext(
+        platforms=[
+            FakePlatform(
+                bot,
+                platform_id="runtime-id",
+                meta_id="meta-id",
+                metadata_id="metadata-id",
+                config_id="config-id",
+            ),
+            FakePlatform(bot, platform_id="runtime-only"),
+            FakePlatform(
+                bot,
+                platform_id="qq-official",
+                meta_name="qq_official",
+            ),
+            FakePlatform(object(), meta_id="not-onebot"),
+        ]
+    )
+
+    assert onebot_platform_ids(context) == ["meta-id", "runtime-only"]
 
 
 def test_extract_group_member_increase_and_decrease_notices():
