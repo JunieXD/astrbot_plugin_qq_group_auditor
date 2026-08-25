@@ -237,7 +237,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.2"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.3"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -832,7 +832,7 @@ async def test_backfill_direct_failure_is_retriable_without_false_membership(mon
     event = FakeEvent(message="qgaudit backfill 123")
 
     first = await collect(plugin.qgaudit_backfill(event))
-    assert "设置接口失败（含已退群或权限不足）：1" in first[0]
+    assert "当前不在群内：1" in first[0]
     assert plugin.audit_store.detail(
         group_id="123", application_id=application_id
     )["memberships"] == []
@@ -845,6 +845,63 @@ async def test_backfill_direct_failure_is_retriable_without_false_membership(mon
             "memberships"
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_group_member_is_not_reported_as_card_failure(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="2029",
+            flag="not-joined",
+            sub_type="add",
+            requested_at=1900,
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    notices = []
+
+    async def missing_member(*args, **kwargs):
+        raise module.PlatformActionError(
+            "set_group_card failed: 群(123)成员20002不存在"
+        )
+
+    async def fake_notify(*args, **kwargs):
+        notices.append((args, kwargs))
+
+    monkeypatch.setattr(module, "set_group_card", missing_member)
+    monkeypatch.setattr(plugin, "_notify_card_error", fake_notify)
+    result = await plugin._set_card_from_application(
+        group_config=module.find_group_config(plugin.config, "123"),
+        application=plugin.audit_store.application_for_reconciliation(application_id),
+        action_source="member_reconcile_direct",
+        notify_error=True,
+    )
+
+    assert result == "not_in_group"
+    assert notices == []
+    assert plugin.audit_store.detail(
+        group_id="123", application_id=application_id
+    )["memberships"] == []
 
 
 @pytest.mark.asyncio

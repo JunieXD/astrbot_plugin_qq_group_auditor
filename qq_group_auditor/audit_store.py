@@ -11,6 +11,7 @@ from .models import GroupMemberDecrease, GroupMemberIncrease, JoinRequest
 
 
 APPLICATION_MATCH_WINDOW_SECONDS = 30 * 24 * 60 * 60
+PENDING_JOIN_RECONCILE_WINDOW_SECONDS = 15 * 60
 
 
 def _event_hash(*parts: Any) -> str:
@@ -552,7 +553,18 @@ class AuditStore:
         sql = f"""
             SELECT a.id FROM applications a
             WHERE a.platform_id = ? AND a.group_id IN ({placeholders})
-              AND a.requested_at BETWEEN ? AND ?
+              AND MAX(
+                  COALESCE((
+                      SELECT MAX(approved.occurred_at)
+                      FROM application_actions approved
+                      WHERE approved.application_id = a.id
+                        AND approved.kind = 'platform'
+                        AND approved.action = 'approve'
+                        AND approved.status IN ('succeeded', 'observed')
+                  ), 0),
+                  COALESCE(a.external_checked_at, 0),
+                  a.requested_at
+              ) BETWEEN ? AND ?
               AND NOT EXISTS (
                   SELECT 1 FROM membership_sessions ms WHERE ms.application_id = a.id
               )
@@ -574,7 +586,7 @@ class AuditStore:
             ORDER BY a.requested_at DESC, a.id DESC LIMIT ?
         """
         params: list[Any] = [platform_id, *group_ids]
-        params.extend((now - APPLICATION_MATCH_WINDOW_SECONDS, now + 60, limit))
+        params.extend((now - PENDING_JOIN_RECONCILE_WINDOW_SECONDS, now + 60, limit))
         with self._lock:
             rows = self._connection.execute(sql, params).fetchall()
             applications = [

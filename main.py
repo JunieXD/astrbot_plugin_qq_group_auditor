@@ -91,6 +91,15 @@ def _is_deepseek_provider_id(provider_id: Any) -> bool:
     return source_id == "deepseek" or source_id.startswith("deepseek-")
 
 
+def _is_missing_group_member_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return bool(
+        re.search(r"成员.*不存在", message)
+        or "member not found" in message
+        or "not in group" in message
+    )
+
+
 @filter.command_group("qgaudit")
 def qgaudit():
     pass
@@ -284,7 +293,7 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.2")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.3")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -373,7 +382,7 @@ class QQGroupAuditorPlugin(Star):
                     and group_config.get("auto_set_card", False)
                 ):
                     confirmed = await self._reconcile_application_member(application_id)
-                    if confirmed in {None, "failed"}:
+                    if confirmed in {None, "failed", "not_in_group"}:
                         self._schedule_application_reconciliation(application_id)
 
     async def _persist_request(
@@ -805,6 +814,13 @@ class QQGroupAuditorPlugin(Star):
                 platform_id=platform_id,
             )
         except PlatformActionError as exc:
+            if _is_missing_group_member_error(exc):
+                logger.debug(
+                    "group member is not present yet: group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+                return "not_in_group"
             logger.info(
                 "direct group card update failed: group=%s user=%s error=%s",
                 group_id,
@@ -895,7 +911,7 @@ class QQGroupAuditorPlugin(Star):
                     application_id,
                     notify_error=index == len(_JOIN_CONFIRM_RETRY_DELAYS) - 1,
                 )
-                if result not in {None, "failed"}:
+                if result not in {None, "failed", "not_in_group"}:
                     return
 
         task = asyncio.create_task(retry())
@@ -923,13 +939,10 @@ class QQGroupAuditorPlugin(Star):
             now=now,
         )
         for application in applications:
-            application_id = int(application["id"])
-            result = await self._reconcile_application_member(
-                application_id,
+            await self._reconcile_application_member(
+                int(application["id"]),
                 application=application,
             )
-            if result == "failed":
-                self._schedule_application_reconciliation(application_id)
 
     async def _backfill_group_cards(
         self,
@@ -953,6 +966,7 @@ class QQGroupAuditorPlugin(Star):
             "succeeded": 0,
             "already_done": 0,
             "skipped": 0,
+            "not_in_group": 0,
             "failed": 0,
         }
         for index, application in enumerate(applications):
@@ -1126,7 +1140,8 @@ class QQGroupAuditorPlugin(Star):
             f"本次修改成功：{counts['succeeded']}\n"
             f"此前已经处理：{counts['already_done']}\n"
             f"因模板或平台标记不可修改而跳过：{counts['skipped']}\n"
-            f"设置接口失败（含已退群或权限不足）：{counts['failed']}\n"
+            f"当前不在群内：{counts['not_in_group']}\n"
+            f"其他设置失败：{counts['failed']}\n"
             f"无可用的通过记录：{counts['unmatched']}"
         )
 

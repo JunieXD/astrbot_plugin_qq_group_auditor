@@ -367,3 +367,38 @@ def test_late_join_notice_merges_direct_confirmation(tmp_path):
     assert detail["memberships"][0]["join_operator_qq"] == "30001"
     assert detail["memberships"][0]["correlation"] == "group_increase"
     store.close()
+
+
+def test_pending_join_reconciliation_uses_recent_approval_and_expires(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("old-request", 1000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+        occurred_at=10_000,
+    )
+
+    recent = store.pending_join_applications(
+        platform_id="napcat-1",
+        group_ids=["123"],
+        now=10_000,
+    )
+    expired = store.pending_join_applications(
+        platform_id="napcat-1",
+        group_ids=["123"],
+        now=10_901,
+    )
+
+    assert [item["id"] for item in recent] == [application_id]
+    assert expired == []
+    store.close()
