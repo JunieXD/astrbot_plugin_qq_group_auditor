@@ -8,8 +8,10 @@ from .models import (
     GroupMemberDecrease,
     GroupMemberIncrease,
     GroupMemberInfo,
+    GroupMemberSnapshot,
     JoinRequest,
 )
+from .text import extract_application_answer
 
 
 class PlatformActionError(Exception):
@@ -34,7 +36,8 @@ def extract_join_request(event: Any) -> JoinRequest | None:
     user_id = str(_raw_get(raw, "user_id") or "").strip()
     flag = str(_raw_get(raw, "flag") or "").strip()
     sub_type = str(_raw_get(raw, "sub_type") or "").strip()
-    answer = str(_raw_get(raw, "comment") or "").strip()
+    raw_comment = str(_raw_get(raw, "comment") or "").strip()
+    answer = extract_application_answer(raw_comment)
     requested_at = int(_raw_get(raw, "time") or time.time())
     self_id = str(_raw_get(raw, "self_id") or "").strip()
 
@@ -52,7 +55,7 @@ def extract_join_request(event: Any) -> JoinRequest | None:
         sub_type=sub_type,
         requested_at=requested_at,
         self_id=self_id,
-        raw_comment=answer,
+        raw_comment=raw_comment,
     )
 
 
@@ -213,6 +216,48 @@ async def get_group_member_info(
         join_time=int(data.get("join_time") or 0),
         card_changeable=card_changeable if isinstance(card_changeable, bool) else None,
     )
+
+
+async def get_group_member_list(
+    context: Any,
+    *,
+    group_id: str,
+    platform_id: str | None = None,
+) -> list[GroupMemberSnapshot]:
+    bot = find_onebot_bot(context, platform_id=platform_id)
+    try:
+        data = await bot.call_action(
+            action="get_group_member_list",
+            group_id=group_id,
+            no_cache=True,
+        )
+    except Exception as exc:
+        raise PlatformActionError(f"get_group_member_list failed: {exc}") from exc
+    if isinstance(data, dict):
+        data = data.get("members") or data.get("data")
+    if not isinstance(data, list):
+        raise PlatformActionError("get_group_member_list returned invalid data")
+
+    members: list[GroupMemberSnapshot] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        user_id = str(item.get("user_id") or "").strip()
+        if not user_id:
+            continue
+        card_changeable = item.get("card_changeable")
+        members.append(
+            GroupMemberSnapshot(
+                user_id=user_id,
+                nickname=str(item.get("nickname") or "").strip(),
+                card=str(item.get("card") or "").strip(),
+                join_time=int(item.get("join_time") or 0),
+                card_changeable=(
+                    card_changeable if isinstance(card_changeable, bool) else None
+                ),
+            )
+        )
+    return members
 
 
 async def set_group_card(

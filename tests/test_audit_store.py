@@ -159,3 +159,129 @@ def test_invited_join_without_application_is_queryable(tmp_path):
     assert detail["memberships"][0]["join_sub_type"] == "invite"
     assert detail["memberships"][0]["join_operator_qq"] == "30001"
     store.close()
+
+
+def test_confirmed_member_and_late_increase_share_one_membership(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("flag-1", 1000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    confirmed = GroupMemberIncrease("123", "20001", "99999", "approve", 1010, "99999")
+    first = store.record_join(
+        platform_id="napcat-1",
+        event=confirmed,
+        nickname="成员",
+        application_id_hint=application_id,
+        correlation_hint="member_reconcile",
+    )
+    late_notice = GroupMemberIncrease("123", "20001", "30001", "approve", 1010, "99999")
+    second = store.record_join(
+        platform_id="napcat-1",
+        event=late_notice,
+        nickname="成员",
+    )
+
+    assert first == (first[0], application_id, True)
+    assert second == (first[0], application_id, False)
+    detail = store.detail(group_id="123", application_id=application_id)
+    assert len(detail["memberships"]) == 1
+    assert detail["memberships"][0]["join_operator_qq"] == "30001"
+    store.close()
+
+
+def test_duplicate_join_can_be_linked_when_application_arrives_late(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    join = GroupMemberIncrease("123", "20001", "30001", "approve", 1010, "99999")
+    membership_id, application_id, created = store.record_join(
+        platform_id="napcat-1",
+        event=join,
+        nickname="成员",
+    )
+    assert application_id is None
+    assert created is True
+
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("late-flag", 1000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    duplicate = store.record_join(
+        platform_id="napcat-1",
+        event=join,
+        nickname="成员",
+        application_id_hint=application_id,
+        correlation_hint="card_backfill",
+    )
+
+    assert duplicate == (membership_id, application_id, False)
+    detail = store.detail(group_id="123", application_id=application_id)
+    assert detail["memberships"][0]["id"] == membership_id
+    store.close()
+
+
+def test_backfill_can_correct_an_inferred_external_rejection(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("flag-1", 1000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.mark_external_checked(
+        application_id=application_id,
+        actor_qq="30001",
+        observed_at=1010,
+    )
+    assert store.infer_external_rejections(
+        platform_id="napcat-1",
+        now=1130,
+        grace_seconds=120,
+    ) == 1
+
+    application = store.find_application_for_member(
+        platform_id="napcat-1",
+        group_id="123",
+        user_id="20001",
+        joined_at=5_000_000,
+    )
+
+    assert application["id"] == application_id
+    assert application["time_correlation_fallback"] == "single_candidate"
+    store.close()
+
+
+def test_backfill_skips_ambiguous_applications_outside_the_time_window(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    for index, requested_at in enumerate((1000, 2000), start=1):
+        application_id, _ = store.record_application(
+            platform_id="napcat-1",
+            request=request(f"flag-{index}", requested_at, f"答案{index}"),
+            question="问题",
+            question_source="config",
+            review_prompt="规则",
+        )
+        store.record_action(
+            application_id=application_id,
+            kind="platform",
+            action="approve",
+            actor_qq="99999",
+            source="plugin",
+            status="succeeded",
+        )
+
+    application = store.find_application_for_member(
+        platform_id="napcat-1",
+        group_id="123",
+        user_id="20001",
+        joined_at=5_000_000,
+    )
+
+    assert application is None
+    store.close()

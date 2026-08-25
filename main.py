@@ -22,13 +22,19 @@ try:
         is_group_admin,
         normalize_config,
     )
-    from .qq_group_auditor.models import GroupMemberInfo, JoinRequest, ReviewDecision
+    from .qq_group_auditor.models import (
+        GroupMemberIncrease,
+        GroupMemberInfo,
+        JoinRequest,
+        ReviewDecision,
+    )
     from .qq_group_auditor.notifier import format_notice, send_admin_notice
     from .qq_group_auditor.platform import (
         extract_group_member_decrease,
         extract_group_member_increase,
         extract_join_request,
         get_group_member_info,
+        get_group_member_list,
         get_group_question,
         get_group_system_requests,
         set_group_card,
@@ -36,6 +42,7 @@ try:
     )
     from .qq_group_auditor.reviewer import LLMReviewError, review_answer
     from .qq_group_auditor.service import AuditService
+    from .qq_group_auditor.text import extract_application_answer
 except ImportError:  # pragma: no cover - supports direct local imports in tests/dev.
     from qq_group_auditor.audit_store import AuditStore
     from qq_group_auditor.audit_text import format_detail, format_history
@@ -46,13 +53,19 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
         is_group_admin,
         normalize_config,
     )
-    from qq_group_auditor.models import GroupMemberInfo, JoinRequest, ReviewDecision
+    from qq_group_auditor.models import (
+        GroupMemberIncrease,
+        GroupMemberInfo,
+        JoinRequest,
+        ReviewDecision,
+    )
     from qq_group_auditor.notifier import format_notice, send_admin_notice
     from qq_group_auditor.platform import (
         extract_group_member_decrease,
         extract_group_member_increase,
         extract_join_request,
         get_group_member_info,
+        get_group_member_list,
         get_group_question,
         get_group_system_requests,
         set_group_card,
@@ -60,6 +73,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
     )
     from qq_group_auditor.reviewer import LLMReviewError, review_answer
     from qq_group_auditor.service import AuditService
+    from qq_group_auditor.text import extract_application_answer
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +81,7 @@ logger = logging.getLogger(__name__)
 _DEEPSEEK_JSON_MAX_TOKENS = 512
 _EXTERNAL_REJECTION_GRACE_SECONDS = 120
 _RECONCILE_INTERVAL_SECONDS = 60
+_JOIN_CONFIRM_RETRY_DELAYS = (1, 3, 8, 20)
 _PLUGIN_NAME = "astrbot_plugin_qq_group_auditor"
 
 
@@ -209,6 +224,11 @@ def parse_detail_command(message_str: str) -> tuple[str, int | str] | None:
     return match.group(1), record_id.upper() if record_id[0].isalpha() else int(record_id)
 
 
+def parse_backfill_command(message_str: str) -> str | None:
+    match = re.match(r"^\s*/?qgaudit\s+backfill\s+(\S+)\s*$", message_str)
+    return match.group(1) if match else None
+
+
 def _event_message_text(event: Any) -> str:
     for attr in ("message_str", "message", "raw_message"):
         value = getattr(event, attr, None)
@@ -238,6 +258,16 @@ def _platform_id(event: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _timestamp(value: Any, default: int) -> int:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return default
+    if timestamp > 10_000_000_000:
+        timestamp //= 1000
+    return timestamp if timestamp > 0 else default
+
+
 def _audit_database_path() -> str | Path:
     try:
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -253,13 +283,16 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.0")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.1")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
         self.context = context
         self.config = normalize_config(dict(config or {}))
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._application_tasks: dict[int, asyncio.Task[None]] = {}
+        self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._backfill_locks: dict[str, asyncio.Lock] = {}
         try:
             self.audit_store: AuditStore | None = AuditStore(_audit_database_path())
         except Exception:
@@ -276,6 +309,12 @@ class QQGroupAuditorPlugin(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reconcile_task
             self._reconcile_task = None
+        application_tasks = list(self._application_tasks.values())
+        self._application_tasks.clear()
+        for task in application_tasks:
+            task.cancel()
+        if application_tasks:
+            await asyncio.gather(*application_tasks, return_exceptions=True)
         if self.audit_store is not None:
             self.audit_store.close()
             self.audit_store = None
@@ -326,6 +365,15 @@ class QQGroupAuditorPlugin(Star):
                 self._record_service_result(application_id, request, result)
             except Exception:
                 logger.exception("failed to persist group review result")
+            else:
+                if (
+                    result.platform_action == "approve"
+                    and result.platform_status == "succeeded"
+                    and group_config.get("auto_set_card", False)
+                ):
+                    confirmed = await self._reconcile_application_member(application_id)
+                    if confirmed in {None, "failed"}:
+                        self._schedule_application_reconciliation(application_id)
 
     async def _persist_request(
         self,
@@ -347,7 +395,13 @@ class QQGroupAuditorPlugin(Star):
             if platform_question:
                 question = platform_question
                 question_source = "platform"
-        request = replace(request, question=question)
+        raw_comment = request.raw_comment or request.answer
+        request = replace(
+            request,
+            question=question,
+            answer=extract_application_answer(raw_comment),
+            raw_comment=raw_comment,
+        )
         assert self.audit_store is not None
         application_id, _ = self.audit_store.record_application(
             platform_id=platform_id or "aiocqhttp",
@@ -423,41 +477,89 @@ class QQGroupAuditorPlugin(Star):
         except Exception as exc:
             member_error = str(exc)
             logger.warning("failed to load new group member info", exc_info=True)
-
-        membership_id: int | None = None
-        application_id: int | None = None
-        created = True
-        if self.audit_store is not None:
-            try:
-                membership_id, application_id, created = self.audit_store.record_join(
-                    platform_id=platform_id or "aiocqhttp",
-                    event=increase,
-                    nickname=member_info.nickname,
-                    old_card=member_info.card,
-                )
-                if application_id is not None and created:
-                    self.audit_store.record_action(
-                        application_id=application_id,
-                        kind="platform",
-                        action="approve" if increase.sub_type == "approve" else "invite",
-                        actor_qq=increase.operator_id,
-                        source="group_increase",
-                        status="observed",
-                        occurred_at=increase.occurred_at,
-                    )
-            except Exception:
-                logger.exception("failed to persist group increase event")
-        if not created or not group_config.get("auto_set_card", False):
-            return
-        await self._apply_member_card(
+        await self._process_member_increase(
             group_config=group_config,
             increase=increase,
             platform_id=platform_id,
             member_info=member_info,
             member_error=member_error,
-            membership_id=membership_id,
-            application_id=application_id,
+            action_source="group_increase",
         )
+
+    async def _process_member_increase(
+        self,
+        *,
+        group_config: dict[str, Any],
+        increase: GroupMemberIncrease,
+        platform_id: str | None,
+        member_info: GroupMemberInfo,
+        member_error: str = "",
+        application_id_hint: int | None = None,
+        action_source: str,
+        force_card: bool = False,
+        notify_error: bool = True,
+    ) -> str:
+        normalized_platform_id = platform_id or "aiocqhttp"
+        lock_key = (normalized_platform_id, increase.group_id, increase.user_id)
+        lock = self._member_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            membership_id: int | None = None
+            application_id: int | None = application_id_hint
+            created = True
+            if self.audit_store is not None:
+                try:
+                    membership_id, application_id, created = self.audit_store.record_join(
+                        platform_id=normalized_platform_id,
+                        event=increase,
+                        nickname=member_info.nickname,
+                        old_card=member_info.card,
+                        application_id_hint=application_id_hint,
+                        correlation_hint=action_source,
+                    )
+                    if application_id is not None:
+                        self.audit_store.record_action(
+                            application_id=application_id,
+                            kind="platform",
+                            action=(
+                                "approve" if increase.sub_type == "approve" else "invite"
+                            ),
+                            actor_qq=increase.operator_id,
+                            source=action_source,
+                            status="observed",
+                            reason=(
+                                "通过成员信息接口确认已入群"
+                                if action_source != "group_increase"
+                                else ""
+                            ),
+                            occurred_at=increase.occurred_at,
+                        )
+                except Exception:
+                    logger.exception("failed to persist group increase event")
+
+            auto_card_enabled = bool(
+                group_config.get("enabled", True)
+                and group_config.get("auto_set_card", False)
+            )
+            if not auto_card_enabled:
+                return "disabled"
+            if not created and not force_card:
+                return "already_seen"
+            if (
+                self.audit_store is not None
+                and membership_id is not None
+                and self.audit_store.has_successful_card_operation(membership_id)
+            ):
+                return "already_done"
+            return await self._apply_member_card(
+                group_config=group_config,
+                increase=increase,
+                platform_id=platform_id,
+                member_info=member_info,
+                member_error=member_error,
+                membership_id=membership_id,
+                application_id=application_id,
+                notify_error=notify_error,
+            )
 
     def _handle_member_decrease(self, event: Any, decrease: Any) -> None:
         group_config = find_group_policy(self.config, decrease.group_id)
@@ -507,7 +609,8 @@ class QQGroupAuditorPlugin(Star):
         member_error: str,
         membership_id: int | None,
         application_id: int | None,
-    ) -> None:
+        notify_error: bool,
+    ) -> str:
         template = str(group_config.get("card_template") or "{nickname}")
         application = None
         if self.audit_store is not None and application_id is not None:
@@ -516,13 +619,23 @@ class QQGroupAuditorPlugin(Star):
                 application_id=application_id,
             )
         question = str((application or {}).get("question") or "")
-        answer = str((application or {}).get("answer") or "")
+        stored_answer = str((application or {}).get("answer") or "")
+        raw_comment = str((application or {}).get("raw_comment") or stored_answer)
+        answer = extract_application_answer(raw_comment)
+        if (
+            self.audit_store is not None
+            and application_id is not None
+            and answer != stored_answer
+        ):
+            self.audit_store.update_application_answer(application_id, answer)
         target_card = ""
         error = member_error
         status = "failed" if error else "pending"
+        result = "failed" if error else "pending"
         if not error and member_info.card_changeable is False:
             error = "平台报告该成员的群名片不可修改"
             status = "skipped"
+            result = "skipped"
         if not error:
             try:
                 target_card = render_card(
@@ -536,20 +649,27 @@ class QQGroupAuditorPlugin(Star):
             except CardTemplateError as exc:
                 error = str(exc)
                 status = "skipped"
+                result = "skipped"
         if not error:
-            try:
-                await set_group_card(
-                    self.context,
-                    group_id=increase.group_id,
-                    user_id=increase.user_id,
-                    card=target_card,
-                    platform_id=platform_id,
-                )
-            except Exception as exc:
-                error = str(exc)
-                status = "failed"
-            else:
+            if member_info.card == target_card:
                 status = "succeeded"
+                result = "already_target"
+            else:
+                try:
+                    await set_group_card(
+                        self.context,
+                        group_id=increase.group_id,
+                        user_id=increase.user_id,
+                        card=target_card,
+                        platform_id=platform_id,
+                    )
+                except Exception as exc:
+                    error = str(exc)
+                    status = "failed"
+                    result = "failed"
+                else:
+                    status = "succeeded"
+                    result = "succeeded"
         if self.audit_store is not None and membership_id is not None:
             try:
                 self.audit_store.record_card_operation(
@@ -562,7 +682,7 @@ class QQGroupAuditorPlugin(Star):
                 )
             except Exception:
                 logger.exception("failed to persist group card operation")
-        if error:
+        if error and notify_error:
             await self._notify_card_error(
                 group_config,
                 increase.group_id,
@@ -570,6 +690,7 @@ class QQGroupAuditorPlugin(Star):
                 error,
                 platform_id,
             )
+        return result
 
     async def _notify_card_error(
         self,
@@ -590,6 +711,204 @@ class QQGroupAuditorPlugin(Star):
         except Exception:
             logger.warning("failed to send card error notification", exc_info=True)
 
+    @staticmethod
+    def _application_matches_member(
+        application: dict[str, Any],
+        member_info: GroupMemberInfo,
+    ) -> bool:
+        if member_info.join_time <= 0:
+            return bool(application.get("explicitly_approved"))
+        requested_at = int(application.get("requested_at") or 0)
+        return (
+            member_info.join_time - 30 * 24 * 60 * 60
+            <= requested_at
+            <= member_info.join_time + 60
+        )
+
+    async def _reconcile_application_member(
+        self,
+        application_id: int,
+        *,
+        application: dict[str, Any] | None = None,
+        notify_error: bool = False,
+    ) -> str | None:
+        if self.audit_store is None:
+            return None
+        application = application or self.audit_store.application_for_reconciliation(
+            application_id
+        )
+        if application is None:
+            return None
+        group_id = str(application.get("group_id") or "")
+        user_id = str(application.get("applicant_qq") or "")
+        platform_id = str(application.get("platform_id") or "aiocqhttp")
+        group_config = find_group_config(self.config, group_id)
+        if (
+            group_config is None
+            or not group_config.get("auto_set_card", False)
+            or not group_id
+            or not user_id
+        ):
+            return None
+        try:
+            member_info = await get_group_member_info(
+                self.context,
+                group_id=group_id,
+                user_id=user_id,
+                platform_id=platform_id,
+            )
+        except Exception:
+            logger.debug(
+                "approved applicant is not a confirmed group member yet: group=%s user=%s",
+                group_id,
+                user_id,
+                exc_info=True,
+            )
+            return None
+        if not self._application_matches_member(application, member_info):
+            return None
+
+        occurred_at = (
+            member_info.join_time
+            or int(application.get("approval_at") or 0)
+            or int(application.get("requested_at") or time.time())
+        )
+        increase = GroupMemberIncrease(
+            group_id=group_id,
+            user_id=user_id,
+            operator_id=str(application.get("approval_actor_qq") or ""),
+            sub_type="approve",
+            occurred_at=occurred_at,
+            self_id=str(application.get("self_id") or ""),
+        )
+        return await self._process_member_increase(
+            group_config=group_config,
+            increase=increase,
+            platform_id=platform_id,
+            member_info=member_info,
+            application_id_hint=application_id,
+            action_source="member_reconcile",
+            force_card=True,
+            notify_error=notify_error,
+        )
+
+    def _schedule_application_reconciliation(self, application_id: int) -> None:
+        existing = self._application_tasks.get(application_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            for index, delay in enumerate(_JOIN_CONFIRM_RETRY_DELAYS):
+                await asyncio.sleep(delay)
+                result = await self._reconcile_application_member(
+                    application_id,
+                    notify_error=index == len(_JOIN_CONFIRM_RETRY_DELAYS) - 1,
+                )
+                if result not in {None, "failed"}:
+                    return
+
+        task = asyncio.create_task(retry())
+        self._application_tasks[application_id] = task
+
+        def completed(done: asyncio.Task[None]) -> None:
+            if self._application_tasks.get(application_id) is done:
+                self._application_tasks.pop(application_id, None)
+            if not done.cancelled() and done.exception() is not None:
+                logger.warning("failed to reconcile approved applicant: %s", done.exception())
+
+        task.add_done_callback(completed)
+
+    async def _reconcile_missing_joins(self, platform_id: str, now: int) -> None:
+        if self.audit_store is None:
+            return
+        group_ids = [
+            str(item.get("group_id") or "")
+            for item in self.config.get("group_audits") or []
+            if item.get("enabled", True) and item.get("auto_set_card", False)
+        ]
+        applications = self.audit_store.pending_join_applications(
+            platform_id=platform_id,
+            group_ids=group_ids,
+            now=now,
+        )
+        for application in applications:
+            application_id = int(application["id"])
+            result = await self._reconcile_application_member(
+                application_id,
+                application=application,
+            )
+            if result == "failed":
+                self._schedule_application_reconciliation(application_id)
+
+    async def _backfill_group_cards(
+        self,
+        *,
+        platform_id: str,
+        group_config: dict[str, Any],
+    ) -> dict[str, int]:
+        assert self.audit_store is not None
+        group_id = str(group_config["group_id"])
+        members = await get_group_member_list(
+            self.context,
+            group_id=group_id,
+            platform_id=platform_id,
+        )
+        current_members = {member.user_id: member for member in members}
+        candidate_ids = self.audit_store.card_candidate_user_ids(
+            platform_id=platform_id,
+            group_id=group_id,
+        )
+        counts = {
+            "recorded": len(candidate_ids),
+            "not_in_group": 0,
+            "unmatched": 0,
+            "succeeded": 0,
+            "already_target": 0,
+            "already_done": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        now = int(time.time())
+        for user_id in candidate_ids:
+            member = current_members.get(user_id)
+            if member is None:
+                counts["not_in_group"] += 1
+                continue
+            application = self.audit_store.find_application_for_member(
+                platform_id=platform_id,
+                group_id=group_id,
+                user_id=user_id,
+                joined_at=member.join_time,
+                now=now,
+            )
+            if application is None:
+                counts["unmatched"] += 1
+                continue
+            occurred_at = (
+                member.join_time
+                or int(application.get("approval_at") or 0)
+                or int(application.get("requested_at") or now)
+            )
+            result = await self._process_member_increase(
+                group_config=group_config,
+                increase=GroupMemberIncrease(
+                    group_id=group_id,
+                    user_id=user_id,
+                    operator_id=str(application.get("approval_actor_qq") or ""),
+                    sub_type="approve",
+                    occurred_at=occurred_at,
+                    self_id=str(application.get("self_id") or ""),
+                ),
+                platform_id=platform_id,
+                member_info=member.info(),
+                application_id_hint=int(application["id"]),
+                action_source="card_backfill",
+                force_card=True,
+                notify_error=False,
+            )
+            counts[result if result in counts else "failed"] += 1
+        return counts
+
     async def _reconcile_loop(self) -> None:
         while True:
             try:
@@ -605,30 +924,43 @@ class QQGroupAuditorPlugin(Star):
     async def _reconcile_platform(self, platform_id: str) -> None:
         if self.audit_store is None:
             return
-        requests = await get_group_system_requests(
-            self.context,
-            platform_id=platform_id,
-            count=100,
-        )
         now = int(time.time())
+        try:
+            requests = await get_group_system_requests(
+                self.context,
+                platform_id=platform_id,
+                count=100,
+            )
+        except Exception:
+            logger.warning("failed to load group system requests", exc_info=True)
+            requests = []
         for item in requests:
             group_id = str(item.get("group_id") or "").strip()
-            applicant_qq = str(item.get("invitor_uin") or "").strip()
+            applicant_qq = str(
+                item.get("requester_uin")
+                or item.get("user_id")
+                or item.get("invitor_uin")
+                or ""
+            ).strip()
             flag = str(item.get("request_id") or "").strip()
             group_config = find_group_policy(self.config, group_id)
             if not group_id or not applicant_qq or not flag or group_config is None:
                 continue
             if not _tracks_requests(group_config):
                 continue
+            raw_comment = str(item.get("message") or item.get("comment") or "").strip()
             request = JoinRequest(
                 group_id=group_id,
                 applicant_qq=applicant_qq,
-                answer=str(item.get("message") or "").strip(),
+                answer=extract_application_answer(raw_comment),
                 flag=flag,
                 sub_type="add",
-                requested_at=now,
+                requested_at=_timestamp(
+                    item.get("request_time") or item.get("time"),
+                    now,
+                ),
                 nickname=str(item.get("requester_nick") or "").strip(),
-                raw_comment=str(item.get("message") or "").strip(),
+                raw_comment=raw_comment,
             )
             application_id, _ = self.audit_store.record_application(
                 platform_id=platform_id,
@@ -646,6 +978,7 @@ class QQGroupAuditorPlugin(Star):
                     actor_qq=str(item.get("actor") or "").strip(),
                     observed_at=now,
                 )
+        await self._reconcile_missing_joins(platform_id, now)
         self.audit_store.infer_external_rejections(
             platform_id=platform_id,
             now=now,
@@ -690,6 +1023,56 @@ class QQGroupAuditorPlugin(Star):
             return
 
         yield event.plain_result(f"approve={decision.approve} reason={decision.reason}")
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @qgaudit.command("backfill")
+    async def qgaudit_backfill(self, event: Any) -> None:
+        group_id = parse_backfill_command(_event_message_text(event))
+        if group_id is None:
+            yield event.plain_result("用法：/qgaudit backfill <群号>")
+            return
+        if not is_group_admin(self.config, group_id, _sender_id(event)):
+            yield event.plain_result("无权限")
+            return
+        group_config = find_group_config(self.config, group_id)
+        if group_config is None:
+            yield event.plain_result("群未配置或未启用")
+            return
+        if not group_config.get("auto_set_card", False):
+            yield event.plain_result("该群未开启自动修改群名片")
+            return
+        if self.audit_store is None:
+            yield event.plain_result("审计数据库不可用")
+            return
+
+        platform_id = _platform_id(event) or "aiocqhttp"
+        lock_key = f"{platform_id}:{group_id}"
+        lock = self._backfill_locks.setdefault(lock_key, asyncio.Lock())
+        if lock.locked():
+            yield event.plain_result("该群的历史群名片补处理正在执行")
+            return
+        async with lock:
+            try:
+                counts = await self._backfill_group_cards(
+                    platform_id=platform_id,
+                    group_config=group_config,
+                )
+            except Exception:
+                logger.exception("failed to backfill group member cards")
+                yield event.plain_result("历史群名片补处理失败，请查看 AstrBot 日志")
+                return
+
+        yield event.plain_result(
+            "历史群名片补处理完成\n"
+            f"有审计记录的QQ：{counts['recorded']}\n"
+            f"本次修改成功：{counts['succeeded']}\n"
+            f"当前已是目标名片：{counts['already_target']}\n"
+            f"此前已经处理：{counts['already_done']}\n"
+            f"因模板或权限跳过：{counts['skipped']}\n"
+            f"修改失败：{counts['failed']}\n"
+            f"当前不在群内：{counts['not_in_group']}\n"
+            f"入群时间无法匹配申请：{counts['unmatched']}"
+        )
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @qgaudit.command("history")

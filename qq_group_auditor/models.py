@@ -73,6 +73,23 @@ class GroupMemberInfo:
 
 
 @dataclass(frozen=True)
+class GroupMemberSnapshot:
+    user_id: str
+    nickname: str
+    card: str
+    join_time: int = 0
+    card_changeable: bool | None = None
+
+    def info(self) -> GroupMemberInfo:
+        return GroupMemberInfo(
+            nickname=self.nickname,
+            card=self.card,
+            join_time=self.join_time,
+            card_changeable=self.card_changeable,
+        )
+
+
+@dataclass(frozen=True)
 class ActionResult:
     action: str
     reason: str = ""

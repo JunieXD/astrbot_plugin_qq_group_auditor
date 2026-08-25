@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from qq_group_auditor.models import GroupMemberSnapshot
+
 
 class MessageChain:
     def __init__(self, chain=None):
@@ -237,12 +239,19 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.0"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.1"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
     assert ("command", "qgaudit", "test") in command_meta
     assert ("event_message_type", EventMessageType.PRIVATE_MESSAGE) in command_meta
+    backfill_meta = getattr(
+        module.QQGroupAuditorPlugin.qgaudit_backfill,
+        "__qgaudit_filter_meta__",
+        [],
+    )
+    assert ("command", "qgaudit", "backfill") in backfill_meta
+    assert ("event_message_type", EventMessageType.PRIVATE_MESSAGE) in backfill_meta
 
     handler_meta = getattr(
         module.QQGroupAuditorPlugin.handle_group_request,
@@ -293,6 +302,8 @@ def test_parse_test_command_accepts_optional_slash_and_preserves_answer_spaces(m
         "答案  保留 空格",
     )
     assert module.parse_test_command("qgaudit test 123") is None
+    assert module.parse_backfill_command("/qgaudit backfill 123") == "123"
+    assert module.parse_backfill_command("qgaudit backfill") is None
 
 
 @pytest.mark.asyncio
@@ -666,3 +677,189 @@ async def test_reconcile_treats_external_handled_without_join_as_reject(monkeypa
     assert record["actions"][0]["action"] == "reject"
     assert record["actions"][0]["actor_qq"] == "30001"
     assert record["actions"][0]["source"] == "external_inferred"
+
+
+@pytest.mark.asyncio
+async def test_approved_request_sets_card_without_group_increase_notice(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "auto_set_card": True,
+            "card_template": "{answer}-{nickname}",
+            "application_question": "毕业年份",
+        }
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    cards = []
+
+    async def fake_set_group_request(*args, **kwargs):
+        return None
+
+    async def fake_get_group_question(*args, **kwargs):
+        return "毕业年份"
+
+    async def fake_get_group_member_info(*args, **kwargs):
+        return module.GroupMemberInfo(
+            nickname="申请人",
+            card="",
+            join_time=2000,
+            card_changeable=True,
+        )
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module, "get_group_question", fake_get_group_question)
+    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    event = FakeRequestEvent()
+    event.message_obj.raw_message.update(
+        {
+            "comment": "问题：毕业年份\n答案：2028",
+            "time": 1990,
+            "self_id": 99999,
+        }
+    )
+
+    await plugin.handle_group_request(event)
+
+    assert cards == [
+        {
+            "group_id": "123",
+            "user_id": "20002",
+            "card": "2028-申请人",
+            "platform_id": "napcat-1",
+        }
+    ]
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["answer"] == "2028"
+    assert record["raw_comment"] == "问题：毕业年份\n答案：2028"
+    assert len(record["memberships"]) == 1
+    assert record["memberships"][0]["card_operations"][0]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_backfill_updates_historical_card_once_and_is_rerunnable(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "auto_set_card": True,
+            "card_template": "{answer}-{nickname}",
+            "application_question": "毕业年份",
+        }
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="问题：毕业年份\n答案：2028",
+            raw_comment="问题：毕业年份\n答案：2028",
+            flag="historical-1",
+            sub_type="add",
+            requested_at=1900,
+            self_id="99999",
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="30001",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    cards = []
+
+    async def fake_get_group_member_list(*args, **kwargs):
+        return [
+            GroupMemberSnapshot(
+                user_id="20002",
+                nickname="申请人",
+                card="旧名片",
+                join_time=2000,
+                card_changeable=True,
+            )
+        ]
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "get_group_member_list", fake_get_group_member_list)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    event = FakeEvent(message="qgaudit backfill 123")
+
+    first = await collect(plugin.qgaudit_backfill(event))
+    second = await collect(plugin.qgaudit_backfill(event))
+
+    assert len(cards) == 1
+    assert cards[0]["card"] == "2028-申请人"
+    assert "本次修改成功：1" in first[0]
+    assert "此前已经处理：1" in second[0]
+    record = plugin.audit_store.detail(group_id="123", application_id=application_id)
+    assert record["answer"] == "2028"
+    assert len(record["memberships"]) == 1
+    assert len(record["memberships"][0]["card_operations"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_confirms_external_approval_before_inferring_rejection(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "auto_set_card": True,
+            "card_template": "{answer}",
+            "application_question": "毕业年份",
+        }
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    cards = []
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [
+            {
+                "request_id": 12345,
+                "group_id": 123,
+                "requester_uin": 20002,
+                "message": "问题：毕业年份\n答案：2028",
+                "requester_nick": "申请人",
+                "request_time": 900,
+                "checked": True,
+                "actor": 30001,
+            }
+        ]
+
+    async def fake_get_group_member_info(*args, **kwargs):
+        return module.GroupMemberInfo(
+            nickname="申请人",
+            card="",
+            join_time=910,
+            card_changeable=True,
+        )
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    monkeypatch.setattr(module.time, "time", lambda: 1100)
+
+    await plugin._reconcile_platform("napcat-1")
+
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    platform_actions = [
+        action for action in record["actions"] if action["kind"] == "platform"
+    ]
+    assert cards[0]["card"] == "2028"
+    assert any(action["action"] == "approve" for action in platform_actions)
+    assert not any(action["action"] == "reject" for action in platform_actions)

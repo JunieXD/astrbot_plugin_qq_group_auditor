@@ -254,7 +254,7 @@ class AuditStore:
                   WHERE aa.application_id = a.id
                     AND aa.kind = 'platform'
                     AND aa.action = 'reject'
-                    AND aa.status IN ('succeeded', 'observed', 'inferred')
+                    AND aa.status = 'succeeded'
               )
             ORDER BY a.requested_at DESC, a.id DESC
             LIMIT 1
@@ -278,6 +278,8 @@ class AuditStore:
         event: GroupMemberIncrease,
         nickname: str = "",
         old_card: str = "",
+        application_id_hint: int | None = None,
+        correlation_hint: str = "",
     ) -> tuple[int, int | None, bool]:
         join_key = _event_hash(
             "join",
@@ -290,20 +292,116 @@ class AuditStore:
             event.occurred_at,
         )
         with self._lock, self._connection:
+            if application_id_hint is not None:
+                hinted = self._connection.execute(
+                    """
+                    SELECT id FROM applications
+                    WHERE id = ? AND platform_id = ? AND group_id = ? AND applicant_qq = ?
+                    """,
+                    (
+                        application_id_hint,
+                        platform_id,
+                        event.group_id,
+                        event.user_id,
+                    ),
+                ).fetchone()
+                if hinted is None:
+                    raise ValueError("application hint does not match the joining member")
+
             existing = self._connection.execute(
                 "SELECT id, application_id FROM membership_sessions WHERE join_event_key = ?",
                 (join_key,),
             ).fetchone()
             if existing is not None:
                 application_id = existing["application_id"]
+                if application_id is None and application_id_hint is not None:
+                    application_id = application_id_hint
+                    self._connection.execute(
+                        """
+                        UPDATE membership_sessions
+                        SET application_id = ?,
+                            nickname_at_join = CASE
+                                WHEN nickname_at_join = '' THEN ? ELSE nickname_at_join
+                            END,
+                            card_at_join = CASE
+                                WHEN card_at_join = '' THEN ? ELSE card_at_join
+                            END
+                        WHERE id = ?
+                        """,
+                        (
+                            application_id_hint,
+                            nickname,
+                            old_card,
+                            int(existing["id"]),
+                        ),
+                    )
                 return int(existing["id"]), int(application_id) if application_id else None, False
 
-            application_id, correlation = self._match_application(
-                platform_id=platform_id,
-                group_id=event.group_id,
-                user_id=event.user_id,
-                joined_at=event.occurred_at,
-            )
+            same_join = self._connection.execute(
+                """
+                SELECT id, application_id FROM membership_sessions
+                WHERE platform_id = ? AND group_id = ? AND user_id = ?
+                  AND joined_at = ? AND left_at IS NULL
+                ORDER BY id DESC LIMIT 1
+                """,
+                (platform_id, event.group_id, event.user_id, event.occurred_at),
+            ).fetchone()
+            if same_join is not None:
+                application_id = same_join["application_id"]
+                if application_id is None and application_id_hint is not None:
+                    application_id = application_id_hint
+                self._connection.execute(
+                    """
+                    UPDATE membership_sessions
+                    SET application_id = COALESCE(application_id, ?),
+                        self_id = CASE WHEN self_id = '' THEN ? ELSE self_id END,
+                        join_sub_type = CASE WHEN ? != '' THEN ? ELSE join_sub_type END,
+                        join_operator_qq = CASE
+                            WHEN ? != '' AND (
+                                join_operator_qq = '' OR ? = 1 OR ? = 'group_increase'
+                            )
+                            THEN ? ELSE join_operator_qq
+                        END,
+                        correlation = CASE
+                            WHEN ? = 1 OR ? = 'group_increase'
+                            THEN 'group_increase' ELSE correlation
+                        END,
+                        nickname_at_join = CASE WHEN nickname_at_join = '' THEN ? ELSE nickname_at_join END,
+                        card_at_join = CASE WHEN card_at_join = '' THEN ? ELSE card_at_join END
+                    WHERE id = ?
+                    """,
+                    (
+                        application_id_hint,
+                        event.self_id,
+                        event.sub_type,
+                        event.sub_type,
+                        event.operator_id,
+                        int(application_id_hint is None),
+                        correlation_hint,
+                        event.operator_id,
+                        int(application_id_hint is None),
+                        correlation_hint,
+                        nickname,
+                        old_card,
+                        int(same_join["id"]),
+                    ),
+                )
+                return (
+                    int(same_join["id"]),
+                    int(application_id) if application_id else None,
+                    False,
+                )
+
+            if application_id_hint is not None:
+                application_id = application_id_hint
+                correlation = correlation_hint or "confirmed_member"
+            else:
+                application_id, correlation = self._match_application(
+                    platform_id=platform_id,
+                    group_id=event.group_id,
+                    user_id=event.user_id,
+                    joined_at=event.occurred_at,
+                )
             cursor = self._connection.execute(
                 """
                 INSERT INTO membership_sessions (
@@ -335,6 +433,222 @@ class AuditStore:
                     (nickname, application_id),
                 )
         return membership_id, application_id, True
+
+    def application_for_reconciliation(self, application_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT a.*,
+                       EXISTS(
+                           SELECT 1 FROM application_actions approved
+                           WHERE approved.application_id = a.id
+                             AND approved.kind = 'platform'
+                             AND approved.action = 'approve'
+                             AND approved.status IN ('succeeded', 'observed')
+                       ) AS explicitly_approved,
+                       COALESCE(
+                           (
+                               SELECT aa.actor_qq FROM application_actions aa
+                               WHERE aa.application_id = a.id
+                                 AND aa.kind = 'platform' AND aa.action = 'approve'
+                                 AND aa.status IN ('succeeded', 'observed')
+                               ORDER BY aa.occurred_at DESC, aa.id DESC LIMIT 1
+                           ),
+                           NULLIF(a.external_actor_qq, ''),
+                           a.self_id
+                       ) AS approval_actor_qq,
+                       COALESCE(
+                           (
+                               SELECT aa.occurred_at FROM application_actions aa
+                               WHERE aa.application_id = a.id
+                                 AND aa.kind = 'platform' AND aa.action = 'approve'
+                                 AND aa.status IN ('succeeded', 'observed')
+                               ORDER BY aa.occurred_at DESC, aa.id DESC LIMIT 1
+                           ),
+                           a.external_checked_at,
+                           a.requested_at
+                       ) AS approval_at
+                FROM applications a WHERE a.id = ?
+                """,
+                (application_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def pending_join_applications(
+        self,
+        *,
+        platform_id: str,
+        group_ids: list[str],
+        now: int,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not group_ids:
+            return []
+        placeholders = ", ".join("?" for _ in group_ids)
+        sql = f"""
+            SELECT a.id FROM applications a
+            WHERE a.platform_id = ? AND a.group_id IN ({placeholders})
+              AND a.requested_at BETWEEN ? AND ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM membership_sessions ms WHERE ms.application_id = a.id
+              )
+              AND (
+                  a.external_checked_at IS NOT NULL
+                  OR EXISTS (
+                      SELECT 1 FROM application_actions aa
+                      WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                        AND aa.action = 'approve'
+                        AND aa.status IN ('succeeded', 'observed')
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM application_actions aa
+                  WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                    AND aa.action = 'reject'
+                    AND aa.status IN ('succeeded', 'inferred')
+              )
+            ORDER BY a.requested_at DESC, a.id DESC LIMIT ?
+        """
+        params: list[Any] = [platform_id, *group_ids]
+        params.extend((now - APPLICATION_MATCH_WINDOW_SECONDS, now + 60, limit))
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+            applications = [
+                self.application_for_reconciliation(int(row["id"])) for row in rows
+            ]
+        return [application for application in applications if application is not None]
+
+    def card_candidate_user_ids(self, *, platform_id: str, group_id: str) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT DISTINCT applicant_qq FROM applications
+                WHERE platform_id = ? AND group_id = ? AND applicant_qq != ''
+                ORDER BY applicant_qq
+                """,
+                (platform_id, group_id),
+            ).fetchall()
+        return [str(row["applicant_qq"]) for row in rows]
+
+    def find_application_for_member(
+        self,
+        *,
+        platform_id: str,
+        group_id: str,
+        user_id: str,
+        joined_at: int,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        upper_join_time = joined_at + 60 if joined_at > 0 else (now or int(time.time())) + 60
+        lower_join_time = (
+            joined_at - APPLICATION_MATCH_WINDOW_SECONDS if joined_at > 0 else 0
+        )
+        with self._lock:
+            membership = self._connection.execute(
+                """
+                SELECT id, application_id FROM membership_sessions
+                WHERE platform_id = ? AND group_id = ? AND user_id = ?
+                  AND left_at IS NULL AND application_id IS NOT NULL
+                  AND (? <= 0 OR joined_at <= 0 OR ABS(joined_at - ?) <= 60)
+                ORDER BY joined_at DESC, id DESC LIMIT 1
+                """,
+                (platform_id, group_id, user_id, joined_at, joined_at),
+            ).fetchone()
+            if membership is not None:
+                application = self.application_for_reconciliation(
+                    int(membership["application_id"])
+                )
+                if application is not None:
+                    application["membership_id"] = int(membership["id"])
+                    return application
+
+            row = self._connection.execute(
+                """
+                SELECT a.id FROM applications a
+                WHERE a.platform_id = ? AND a.group_id = ? AND a.applicant_qq = ?
+                  AND a.requested_at BETWEEN ? AND ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM membership_sessions ms WHERE ms.application_id = a.id
+                  )
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM application_actions aa
+                          WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                            AND aa.action = 'approve'
+                            AND aa.status IN ('succeeded', 'observed')
+                      )
+                      OR (? > 0 AND a.external_checked_at IS NOT NULL)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM application_actions aa
+                      WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                        AND aa.action = 'reject' AND aa.status = 'succeeded'
+                  )
+                ORDER BY a.requested_at DESC, a.id DESC LIMIT 1
+                """,
+                (
+                    platform_id,
+                    group_id,
+                    user_id,
+                    lower_join_time,
+                    upper_join_time,
+                    joined_at,
+                ),
+            ).fetchone()
+            if row is not None:
+                return self.application_for_reconciliation(int(row["id"]))
+
+            fallback_rows = self._connection.execute(
+                """
+                SELECT a.id FROM applications a
+                WHERE a.platform_id = ? AND a.group_id = ? AND a.applicant_qq = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM membership_sessions ms WHERE ms.application_id = a.id
+                  )
+                  AND (
+                      a.external_checked_at IS NOT NULL
+                      OR EXISTS (
+                          SELECT 1 FROM application_actions aa
+                          WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                            AND aa.action = 'approve'
+                            AND aa.status IN ('succeeded', 'observed')
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM application_actions aa
+                      WHERE aa.application_id = a.id AND aa.kind = 'platform'
+                        AND aa.action = 'reject' AND aa.status = 'succeeded'
+                  )
+                ORDER BY a.requested_at DESC, a.id DESC LIMIT 2
+                """,
+                (platform_id, group_id, user_id),
+            ).fetchall()
+            if len(fallback_rows) != 1:
+                return None
+            application = self.application_for_reconciliation(
+                int(fallback_rows[0]["id"])
+            )
+            if application is not None:
+                application["time_correlation_fallback"] = "single_candidate"
+            return application
+
+    def has_successful_card_operation(self, membership_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM card_operations
+                WHERE membership_id = ? AND status = 'succeeded' LIMIT 1
+                """,
+                (membership_id,),
+            ).fetchone()
+        return row is not None
+
+    def update_application_answer(self, application_id: int, answer: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE applications SET answer = ? WHERE id = ?",
+                (answer, application_id),
+            )
 
     def record_leave(
         self,

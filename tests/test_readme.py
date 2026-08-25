@@ -26,4 +26,5 @@ def test_readme_documents_required_user_flows():
     assert "{answer}" in text
     assert "/qgaudit history" in text
     assert "/qgaudit detail" in text
+    assert "/qgaudit backfill" in text
     assert "external_inferred" in text

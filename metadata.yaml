@@ -1,9 +1,9 @@
 name: astrbot_plugin_qq_group_auditor
 desc: QQ 加群申请审核与审计插件，支持按群自动审核、入群名片模板和历史记录查询。
-help: 私聊使用 /qgaudit test 测试规则，或使用 /qgaudit history 查询历史申请。
-version: v0.2.0
+help: 私聊使用 /qgaudit test 测试规则，使用 /qgaudit history 查询历史申请，或使用 /qgaudit backfill 补处理历史群名片。
+version: v0.2.1
 author: JunieXD
-repo: ""
+repo: https://github.com/JunieXD/astrbot_plugin_qq_group_auditor
 display_name: QQ 加群审核
 short_desc: 自动审核 QQ 加群申请，记录成员进退群历史并按模板设置群名片。
 support_platforms:

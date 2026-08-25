@@ -9,6 +9,7 @@ from qq_group_auditor.platform import (
     extract_join_request,
     find_onebot_bot,
     get_group_member_info,
+    get_group_member_list,
     get_group_question,
     get_group_system_requests,
     set_group_card,
@@ -374,6 +375,36 @@ async def test_group_member_and_card_actions_use_onebot_api():
             "user_id": "20001",
             "card": "申请人-GitHub",
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_group_member_list_normalizes_members_and_skips_invalid_rows():
+    bot = FakeBot()
+    bot.response = [
+        {
+            "user_id": 20001,
+            "nickname": " 申请人 ",
+            "card": "旧名片",
+            "join_time": 1234567890,
+            "card_changeable": True,
+        },
+        {"nickname": "缺少QQ"},
+        "invalid",
+    ]
+
+    members = await get_group_member_list(FakeContext(bot), group_id="123")
+
+    assert len(members) == 1
+    assert members[0].user_id == "20001"
+    assert members[0].nickname == "申请人"
+    assert members[0].info().card == "旧名片"
+    assert bot.calls == [
+        {
+            "action": "get_group_member_list",
+            "group_id": "123",
+            "no_cache": True,
+        }
     ]
 
 
