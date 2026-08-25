@@ -20,3 +20,8 @@ def test_conf_schema_is_valid_json_and_uses_supported_types():
     assert items["notify_on_approve"]["type"] == "bool"
     assert items["notify_on_reject"]["type"] == "bool"
     assert items["notify_on_ignore"]["type"] == "bool"
+    assert items["audit_log_enabled"]["type"] == "bool"
+    assert items["auto_set_card"]["type"] == "bool"
+    assert items["auto_set_card"]["default"] is False
+    assert items["card_template"]["type"] == "string"
+    assert items["application_question"]["type"] == "text"

@@ -41,6 +41,10 @@ def test_normalize_config_preserves_template_list_and_coerces_scalars():
     assert item["reject_reason"] == DEFAULT_REJECT_REASON
     assert item["admin_qq_ids"] == ["10001", "10002"]
     assert item["failure_action"] == "reject"
+    assert item["audit_log_enabled"] is True
+    assert item["auto_set_card"] is False
+    assert item["card_template"] == "{nickname}"
+    assert item["application_question"] == ""
 
 
 def test_invalid_failure_action_defaults_to_ignore():
@@ -98,6 +102,8 @@ def test_string_bool_values_are_normalized():
                     "notify_on_approve": "true",
                     "notify_on_reject": "0",
                     "notify_on_ignore": "on",
+                    "audit_log_enabled": "false",
+                    "auto_set_card": "true",
                 },
                 {
                     "group_id": "2",
@@ -115,6 +121,8 @@ def test_string_bool_values_are_normalized():
     assert first["notify_on_approve"] is True
     assert first["notify_on_reject"] is False
     assert first["notify_on_ignore"] is True
+    assert first["audit_log_enabled"] is False
+    assert first["auto_set_card"] is True
     assert second["enabled"] is True
     assert second["notify_on_approve"] is False
     assert second["notify_on_reject"] is True

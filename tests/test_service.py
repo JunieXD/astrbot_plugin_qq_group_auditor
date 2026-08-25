@@ -78,6 +78,9 @@ async def test_approve_calls_platform_approve_and_optional_notice():
     result = await service.handle_request(group_config(notify_on_approve=True), request())
 
     assert result.action == "approve"
+    assert result.review_action == "approve"
+    assert result.platform_action == "approve"
+    assert result.platform_status == "succeeded"
     assert platform.actions == [(request(), True, "")]
     assert notifier.notices[0][1].startswith("加群审核通过|approve|符合|")
 
@@ -94,6 +97,9 @@ async def test_reject_false_decision_uses_fixed_reason():
     )
 
     assert result.action == "reject"
+    assert result.review_action == "reject"
+    assert result.platform_action == "reject"
+    assert result.platform_status == "succeeded"
     assert platform.actions == [(request(), False, "请重新申请")]
     assert notifier.notices[0][1].startswith("加群审核拒绝|reject|不符合|")
 
@@ -107,6 +113,9 @@ async def test_ignore_false_decision_does_not_call_platform():
     result = await service.handle_request(group_config(notify_on_ignore=True), request())
 
     assert result.action == "ignore"
+    assert result.review_action == "ignore"
+    assert result.platform_action == ""
+    assert result.platform_status == "none"
     assert platform.actions == []
     assert notifier.notices[0][1].startswith("加群审核忽略|ignore|不符合|")
 
@@ -133,6 +142,8 @@ async def test_llm_error_notifies_admin_and_leaves_request_untouched():
     result = await service.handle_request(group_config(), request())
 
     assert result.action == "error"
+    assert result.review_action == "error"
+    assert result.platform_action == ""
     assert platform.actions == []
     assert "LLM审核异常" in notifier.notices[0][1]
     assert "invalid json" in notifier.notices[0][1]
@@ -166,6 +177,8 @@ async def test_llm_error_notice_failure_still_returns_error_result():
     result = await service.handle_request(group_config(), request())
 
     assert result.action == "error"
+    assert result.review_action == "error"
+    assert result.platform_action == ""
     assert result.reason == "invalid json"
     assert platform.actions == []
 
@@ -180,6 +193,9 @@ async def test_platform_error_returns_error_and_notifies_admin():
     result = await service.handle_request(group_config(), request())
 
     assert result.action == "error"
+    assert result.review_action == "approve"
+    assert result.platform_action == "approve"
+    assert result.platform_status == "failed"
     assert "platform failed" in result.reason
     assert platform.actions == []
     assert notifier.notices[0][1].startswith("平台审核接口异常|approve||platform failed")

@@ -4,8 +4,14 @@ import pytest
 
 from qq_group_auditor.platform import (
     PlatformActionError,
+    extract_group_member_decrease,
+    extract_group_member_increase,
     extract_join_request,
     find_onebot_bot,
+    get_group_member_info,
+    get_group_question,
+    get_group_system_requests,
+    set_group_card,
     set_group_request,
 )
 
@@ -32,12 +38,13 @@ class FakeBot:
     def __init__(self) -> None:
         self.calls: list[dict] = []
         self.fail = False
+        self.response = {"status": "ok"}
 
     async def call_action(self, **kwargs):
         self.calls.append(kwargs)
         if self.fail:
             raise RuntimeError("action failed")
-        return {"status": "ok"}
+        return self.response
 
 
 class FakePlatform:
@@ -84,6 +91,8 @@ def test_extract_join_request_from_onebot_add_request():
                 "user_id": 10001,
                 "comment": "AutoEmailSender",
                 "flag": "flag-1",
+                "time": 1234567890,
+                "self_id": 99999,
             }
         )
     )
@@ -95,6 +104,52 @@ def test_extract_join_request_from_onebot_add_request():
     assert request.answer == "AutoEmailSender"
     assert request.flag == "flag-1"
     assert request.sub_type == "add"
+    assert request.requested_at == 1234567890
+    assert request.self_id == "99999"
+    assert request.raw_comment == "AutoEmailSender"
+
+
+def test_extract_group_member_increase_and_decrease_notices():
+    increase = extract_group_member_increase(
+        FakeEvent(
+            RawEvent(
+                {
+                    "post_type": "notice",
+                    "notice_type": "group_increase",
+                    "sub_type": "approve",
+                    "group_id": 123456,
+                    "user_id": 10001,
+                    "operator_id": 30001,
+                    "self_id": 99999,
+                    "time": 1234567890,
+                }
+            )
+        )
+    )
+    decrease = extract_group_member_decrease(
+        FakeEvent(
+            RawEvent(
+                {
+                    "post_type": "notice",
+                    "notice_type": "group_decrease",
+                    "sub_type": "kick",
+                    "group_id": 123456,
+                    "user_id": 10001,
+                    "operator_id": 30002,
+                    "self_id": 99999,
+                    "time": 1234567999,
+                }
+            )
+        )
+    )
+
+    assert increase.group_id == "123456"
+    assert increase.user_id == "10001"
+    assert increase.operator_id == "30001"
+    assert increase.occurred_at == 1234567890
+    assert decrease.sub_type == "kick"
+    assert decrease.operator_id == "30002"
+    assert decrease.occurred_at == 1234567999
 
 
 def test_extract_join_request_ignores_non_group_request():
@@ -282,3 +337,66 @@ async def test_set_group_request_wraps_action_failure():
             approve=True,
             reason="",
         )
+
+
+@pytest.mark.asyncio
+async def test_group_member_and_card_actions_use_onebot_api():
+    bot = FakeBot()
+    bot.response = {
+        "nickname": "申请人",
+        "card": "旧名片",
+        "join_time": 1234567890,
+        "card_changeable": True,
+    }
+    context = FakeContext(bot)
+
+    info = await get_group_member_info(context, group_id="123", user_id="20001")
+    await set_group_card(
+        context,
+        group_id="123",
+        user_id="20001",
+        card="申请人-GitHub",
+    )
+
+    assert info.nickname == "申请人"
+    assert info.card == "旧名片"
+    assert info.join_time == 1234567890
+    assert bot.calls == [
+        {
+            "action": "get_group_member_info",
+            "group_id": "123",
+            "user_id": "20001",
+            "no_cache": True,
+        },
+        {
+            "action": "set_group_card",
+            "group_id": "123",
+            "user_id": "20001",
+            "card": "申请人-GitHub",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_napcat_question_and_system_request_extensions():
+    bot = FakeBot()
+    context = FakeContext(bot)
+    bot.response = {"groupQuestion": "你从哪里知道本群？"}
+
+    question = await get_group_question(context, group_id="123")
+
+    bot.response = {
+        "join_requests": [
+            {
+                "request_id": 1234,
+                "group_id": 123,
+                "invitor_uin": 20001,
+                "checked": True,
+                "actor": 30001,
+            }
+        ]
+    }
+    requests = await get_group_system_requests(context)
+
+    assert question == "你从哪里知道本群？"
+    assert requests[0]["actor"] == 30001

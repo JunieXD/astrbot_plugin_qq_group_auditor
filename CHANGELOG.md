@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0 - 2026-08-25
+
+- 使用 SQLite 保存每一次加群申请、插件审核决定、平台审批操作、实际入群和退群记录。
+- 记录实际入群与退群通知中的操作者 QQ，支持同一成员多次申请和多段成员会话。
+- 增加默认关闭的自动群名片功能，支持 QQ号、QQ昵称、问题、答案和入群时间占位符。
+- 增加 `/qgaudit history` 和 `/qgaudit detail` 私聊审计查询命令。
+- 定期同步 NapCat 群系统消息；外部已处理但未观察到入群的申请按拒绝记录，并标记为推断来源。
+
 ## v0.1.2 - 2026-08-03
 
 - DeepSeek provider 按官方 JSON Output 接口传入 `response_format={"type":"json_object"}`，并为审核结果预留 512 tokens。

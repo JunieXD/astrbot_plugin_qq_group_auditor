@@ -64,14 +64,24 @@ class AuditService:
                 action="error",
                 error=str(exc),
             )
-            return ActionResult(action="error", reason=str(exc))
+            return ActionResult(
+                action="error",
+                reason=str(exc),
+                review_action="error",
+            )
 
         if decision.approve:
             try:
                 await self.platform.set_group_request(request, approve=True, reason="")
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "approve", exc)
-                return ActionResult(action="error", reason=str(exc))
+                return ActionResult(
+                    action="error",
+                    reason=str(exc),
+                    review_action="approve",
+                    platform_action="approve",
+                    platform_status="failed",
+                )
             if group_config.get("notify_on_approve", False):
                 await self._notify_safely(
                     group_config=group_config,
@@ -80,7 +90,13 @@ class AuditService:
                     action="approve",
                     reason=decision.reason,
                 )
-            return ActionResult(action="approve", reason=decision.reason)
+            return ActionResult(
+                action="approve",
+                reason=decision.reason,
+                review_action="approve",
+                platform_action="approve",
+                platform_status="succeeded",
+            )
 
         if group_config.get("failure_action") == "reject":
             reject_reason = str(group_config.get("reject_reason") or "")
@@ -92,7 +108,13 @@ class AuditService:
                 )
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "reject", exc)
-                return ActionResult(action="error", reason=str(exc))
+                return ActionResult(
+                    action="error",
+                    reason=str(exc),
+                    review_action="reject",
+                    platform_action="reject",
+                    platform_status="failed",
+                )
             if group_config.get("notify_on_reject", False):
                 await self._notify_safely(
                     group_config=group_config,
@@ -101,7 +123,13 @@ class AuditService:
                     action="reject",
                     reason=decision.reason,
                 )
-            return ActionResult(action="reject", reason=decision.reason)
+            return ActionResult(
+                action="reject",
+                reason=decision.reason,
+                review_action="reject",
+                platform_action="reject",
+                platform_status="succeeded",
+            )
 
         if group_config.get("notify_on_ignore", False):
             await self._notify_safely(
@@ -111,7 +139,11 @@ class AuditService:
                 action="ignore",
                 reason=decision.reason,
             )
-        return ActionResult(action="ignore", reason=decision.reason)
+        return ActionResult(
+            action="ignore",
+            reason=decision.reason,
+            review_action="ignore",
+        )
 
     async def _decision_for_request(
         self,

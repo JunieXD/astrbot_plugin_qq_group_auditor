@@ -8,6 +8,7 @@ DEFAULT_REJECT_REASON = "加群答案不符合要求，请重新申请并按提�
 DEFAULT_REVIEW_PROMPT = (
     "请判断申请人的加群答案是否符合本群要求。只有答案明确符合要求时才 approve=true。"
 )
+DEFAULT_CARD_TEMPLATE = "{nickname}"
 DEFAULT_CONFIG = {"group_audits": []}
 VALID_FAILURE_ACTIONS = {"ignore", "reject"}
 TRUE_STRINGS = {"true", "1", "yes", "on"}
@@ -66,6 +67,14 @@ def normalize_group_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "notify_on_approve": normalize_bool(item.get("notify_on_approve")),
         "notify_on_reject": normalize_bool(item.get("notify_on_reject")),
         "notify_on_ignore": normalize_bool(item.get("notify_on_ignore")),
+        "audit_log_enabled": normalize_bool(
+            item.get("audit_log_enabled"),
+            default=True,
+        ),
+        "auto_set_card": normalize_bool(item.get("auto_set_card")),
+        "card_template": str(item.get("card_template") or "").strip()
+        or DEFAULT_CARD_TEMPLATE,
+        "application_question": str(item.get("application_question") or "").strip(),
     }
 
 
@@ -87,15 +96,22 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def find_group_config(config: dict[str, Any], group_id: Any) -> dict[str, Any] | None:
+    item = find_group_policy(config, group_id)
+    if item is not None and item.get("enabled", True):
+        return item
+    return None
+
+
+def find_group_policy(config: dict[str, Any], group_id: Any) -> dict[str, Any] | None:
     normalized_group_id = normalize_id(group_id)
     for item in config.get("group_audits") or []:
-        if item.get("group_id") == normalized_group_id and item.get("enabled", True):
+        if item.get("group_id") == normalized_group_id:
             return item
     return None
 
 
 def is_group_admin(config: dict[str, Any], group_id: Any, qq_id: Any) -> bool:
-    group_config = find_group_config(config, group_id)
+    group_config = find_group_policy(config, group_id)
     if group_config is None:
         return False
     return normalize_id(qq_id) in set(group_config.get("admin_qq_ids") or [])

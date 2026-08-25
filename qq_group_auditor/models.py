@@ -18,6 +18,10 @@ class GroupAuditConfig:
     notify_on_approve: bool
     notify_on_reject: bool
     notify_on_ignore: bool
+    audit_log_enabled: bool = True
+    auto_set_card: bool = False
+    card_template: str = "{nickname}"
+    application_question: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,9 +37,45 @@ class JoinRequest:
     answer: str
     flag: str
     sub_type: str
+    requested_at: int = 0
+    self_id: str = ""
+    question: str = ""
+    nickname: str = ""
+    raw_comment: str = ""
+
+
+@dataclass(frozen=True)
+class GroupMemberIncrease:
+    group_id: str
+    user_id: str
+    operator_id: str
+    sub_type: str
+    occurred_at: int
+    self_id: str = ""
+
+
+@dataclass(frozen=True)
+class GroupMemberDecrease:
+    group_id: str
+    user_id: str
+    operator_id: str
+    sub_type: str
+    occurred_at: int
+    self_id: str = ""
+
+
+@dataclass(frozen=True)
+class GroupMemberInfo:
+    nickname: str
+    card: str
+    join_time: int = 0
+    card_changeable: bool | None = None
 
 
 @dataclass(frozen=True)
 class ActionResult:
     action: str
     reason: str = ""
+    review_action: str = ""
+    platform_action: str = ""
+    platform_status: str = "none"

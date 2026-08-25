@@ -208,6 +208,14 @@ class FakeRequestEvent:
         return "napcat-1"
 
 
+class FakeNoticeEvent:
+    def __init__(self, raw_message):
+        self.message_obj = types.SimpleNamespace(raw_message=raw_message)
+
+    def get_platform_id(self):
+        return "napcat-1"
+
+
 def plugin_config():
     return {
         "group_audits": [
@@ -229,7 +237,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.1.2"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.0"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -527,3 +535,134 @@ async def test_runtime_notifier_logs_warning_when_send_admin_notice_fails(monkey
     )
 
     assert warnings == [("failed to send audit notification", True)]
+
+
+@pytest.mark.asyncio
+async def test_external_approval_sets_card_and_leave_closes_same_audit_record(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "auto_set_card": True,
+            "card_template": "{nickname}-{answer}",
+            "application_question": "你从哪里知道本群？",
+        }
+    )
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    cards = []
+
+    async def fake_set_group_request(*args, **kwargs):
+        return None
+
+    async def fake_get_group_question(*args, **kwargs):
+        return "你从哪里知道本群？"
+
+    async def fake_get_group_member_info(*args, **kwargs):
+        return module.GroupMemberInfo(
+            nickname="申请人",
+            card="旧名片",
+            join_time=2000,
+            card_changeable=True,
+        )
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module, "get_group_question", fake_get_group_question)
+    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+
+    request_event = FakeRequestEvent()
+    request_event.message_obj.raw_message["time"] = 1900
+    request_event.message_obj.raw_message["self_id"] = 99999
+    await plugin.handle_group_request(request_event)
+    await plugin.handle_group_membership_notice(
+        FakeNoticeEvent(
+            {
+                "post_type": "notice",
+                "notice_type": "group_increase",
+                "sub_type": "approve",
+                "group_id": 123,
+                "user_id": 20002,
+                "operator_id": 30001,
+                "self_id": 99999,
+                "time": 2000,
+            }
+        )
+    )
+    await plugin.handle_group_membership_notice(
+        FakeNoticeEvent(
+            {
+                "post_type": "notice",
+                "notice_type": "group_decrease",
+                "sub_type": "kick",
+                "group_id": 123,
+                "user_id": 20002,
+                "operator_id": 30002,
+                "self_id": 99999,
+                "time": 2100,
+            }
+        )
+    )
+
+    assert cards == [
+        {
+            "group_id": "123",
+            "user_id": "20002",
+            "card": "申请人-关键词答案",
+            "platform_id": "napcat-1",
+        }
+    ]
+    records = plugin.audit_store.history(group_id="123", applicant_qq="20002")
+    assert len(records) == 1
+    assert records[0]["question"] == "你从哪里知道本群？"
+    assert records[0]["memberships"][0]["join_operator_qq"] == "30001"
+    assert records[0]["memberships"][0]["leave_sub_type"] == "kick"
+    assert records[0]["memberships"][0]["leave_operator_qq"] == "30002"
+    assert records[0]["memberships"][0]["card_operations"][0]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_treats_external_handled_without_join_as_reject(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="关键词答案",
+            flag="12345",
+            sub_type="add",
+            requested_at=900,
+        ),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+
+    async def fake_get_group_system_requests(*args, **kwargs):
+        return [
+            {
+                "request_id": 12345,
+                "group_id": 123,
+                "invitor_uin": 20002,
+                "message": "关键词答案",
+                "requester_nick": "申请人",
+                "checked": True,
+                "actor": 30001,
+            }
+        ]
+
+    monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
+    monkeypatch.setattr(module.time, "time", lambda: 1000)
+    await plugin._reconcile_platform("napcat-1")
+    monkeypatch.setattr(module.time, "time", lambda: 1120)
+    await plugin._reconcile_platform("napcat-1")
+
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["actions"][0]["action"] == "reject"
+    assert record["actions"][0]["actor_qq"] == "30001"
+    assert record["actions"][0]["source"] == "external_inferred"

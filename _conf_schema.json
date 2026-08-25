@@ -57,6 +57,30 @@
             "description": "正常忽略时通知管理员",
             "type": "bool",
             "default": false
+          },
+          "audit_log_enabled": {
+            "description": "保存加群审计记录",
+            "type": "bool",
+            "default": true,
+            "hint": "记录每次申请、审批、入群、退群和名片修改结果。记录长期保存在插件数据目录的 SQLite 数据库中。"
+          },
+          "auto_set_card": {
+            "description": "新成员入群后自动修改群名片",
+            "type": "bool",
+            "default": false,
+            "hint": "默认关闭。无论由 Bot 还是其他管理员通过申请，收到实际入群通知后都会按模板尝试修改。"
+          },
+          "card_template": {
+            "description": "群名片模板",
+            "type": "string",
+            "default": "{nickname}",
+            "hint": "支持 {qq}、{nickname}、{question}、{answer}、{join_date}、{join_time}。例如：{nickname}-{answer}。"
+          },
+          "application_question": {
+            "description": "加群问题备用文本",
+            "type": "text",
+            "default": "",
+            "hint": "NapCat 无法读取当前加群问题时使用，并在收到申请时保存快照。"
           }
         }
       }
