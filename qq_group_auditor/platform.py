@@ -218,6 +218,26 @@ async def get_group_member_info(
     )
 
 
+async def get_user_nickname(
+    context: Any,
+    *,
+    user_id: str,
+    platform_id: str | None = None,
+) -> str:
+    bot = find_onebot_bot(context, platform_id=platform_id)
+    try:
+        data = await bot.call_action(
+            action="get_stranger_info",
+            user_id=user_id,
+            no_cache=True,
+        )
+    except Exception as exc:
+        raise PlatformActionError(f"get_stranger_info failed: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PlatformActionError("get_stranger_info returned invalid data")
+    return str(data.get("nickname") or data.get("nick") or "").strip()
+
+
 async def get_group_member_list(
     context: Any,
     *,

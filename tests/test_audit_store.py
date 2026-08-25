@@ -285,3 +285,85 @@ def test_backfill_skips_ambiguous_applications_outside_the_time_window(tmp_path)
 
     assert application is None
     store.close()
+
+
+def test_backfill_uses_latest_eligible_application_and_not_stale_approval(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    first_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("approved", 1000, "第一次答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.record_action(
+        application_id=first_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+    )
+    rejected_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("rejected", 2000, "第二次答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.record_action(
+        application_id=rejected_id,
+        kind="platform",
+        action="reject",
+        actor_qq="99999",
+        source="plugin",
+        status="succeeded",
+    )
+
+    assert store.card_backfill_applications(
+        platform_id="napcat-1", group_id="123"
+    ) == []
+    store.close()
+
+
+def test_late_join_notice_merges_direct_confirmation(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=request("direct", 1000, "答案"),
+        question="问题",
+        question_source="config",
+        review_prompt="规则",
+    )
+    direct_event = GroupMemberIncrease(
+        "123", "20001", "99999", "approve", 1001, "99999"
+    )
+    membership_id, _, _ = store.record_join(
+        platform_id="napcat-1",
+        event=direct_event,
+        nickname="成员",
+        application_id_hint=application_id,
+        correlation_hint="member_reconcile_direct",
+    )
+
+    notice_event = GroupMemberIncrease(
+        "123", "20001", "30001", "approve", 1010, "99999"
+    )
+    merged_id, merged_application_id, created = store.record_join(
+        platform_id="napcat-1",
+        event=notice_event,
+        nickname="成员",
+        correlation_hint="group_increase",
+    )
+
+    assert (merged_id, merged_application_id, created) == (
+        membership_id,
+        application_id,
+        False,
+    )
+    detail = store.detail(group_id="123", application_id=application_id)
+    assert len(detail["memberships"]) == 1
+    assert detail["memberships"][0]["joined_at"] == 1010
+    assert detail["memberships"][0]["join_operator_qq"] == "30001"
+    assert detail["memberships"][0]["correlation"] == "group_increase"
+    store.close()

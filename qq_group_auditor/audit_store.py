@@ -337,6 +337,60 @@ class AuditStore:
                     )
                 return int(existing["id"]), int(application_id) if application_id else None, False
 
+            if correlation_hint == "group_increase":
+                provisional = self._connection.execute(
+                    """
+                    SELECT id, application_id FROM membership_sessions
+                    WHERE platform_id = ? AND group_id = ? AND user_id = ?
+                      AND left_at IS NULL
+                      AND correlation IN ('member_reconcile_direct', 'card_backfill_direct')
+                      AND joined_at BETWEEN ? AND ?
+                    ORDER BY joined_at DESC, id DESC LIMIT 1
+                    """,
+                    (
+                        platform_id,
+                        event.group_id,
+                        event.user_id,
+                        event.occurred_at - 60,
+                        event.occurred_at + 60,
+                    ),
+                ).fetchone()
+                if provisional is not None:
+                    self._connection.execute(
+                        """
+                        UPDATE membership_sessions
+                        SET join_event_key = ?, self_id = ?, joined_at = ?,
+                            join_sub_type = ?, join_operator_qq = ?,
+                            nickname_at_join = CASE
+                                WHEN ? != '' THEN ? ELSE nickname_at_join
+                            END,
+                            card_at_join = CASE
+                                WHEN ? != '' THEN ? ELSE card_at_join
+                            END,
+                            correlation = 'group_increase', observed_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            join_key,
+                            event.self_id,
+                            event.occurred_at,
+                            event.sub_type,
+                            event.operator_id,
+                            nickname,
+                            nickname,
+                            old_card,
+                            old_card,
+                            int(time.time()),
+                            int(provisional["id"]),
+                        ),
+                    )
+                    application_id = provisional["application_id"]
+                    return (
+                        int(provisional["id"]),
+                        int(application_id) if application_id else None,
+                        False,
+                    )
+
             same_join = self._connection.execute(
                 """
                 SELECT id, application_id FROM membership_sessions
@@ -467,7 +521,17 @@ class AuditStore:
                            ),
                            a.external_checked_at,
                            a.requested_at
-                       ) AS approval_at
+                       ) AS approval_at,
+                       (
+                           SELECT ms.id FROM membership_sessions ms
+                           WHERE ms.application_id = a.id AND ms.left_at IS NULL
+                           ORDER BY ms.joined_at DESC, ms.id DESC LIMIT 1
+                       ) AS membership_id,
+                       (
+                           SELECT ms.joined_at FROM membership_sessions ms
+                           WHERE ms.application_id = a.id AND ms.left_at IS NULL
+                           ORDER BY ms.joined_at DESC, ms.id DESC LIMIT 1
+                       ) AS membership_joined_at
                 FROM applications a WHERE a.id = ?
                 """,
                 (application_id,),
@@ -529,6 +593,71 @@ class AuditStore:
                 (platform_id, group_id),
             ).fetchall()
         return [str(row["applicant_qq"]) for row in rows]
+
+    def card_backfill_applications(
+        self,
+        *,
+        platform_id: str,
+        group_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT a.id, a.applicant_qq,
+                       EXISTS(
+                           SELECT 1 FROM membership_sessions open_ms
+                           WHERE open_ms.application_id = a.id
+                             AND open_ms.left_at IS NULL
+                       ) AS has_open_membership,
+                       EXISTS(
+                           SELECT 1 FROM membership_sessions any_ms
+                           WHERE any_ms.application_id = a.id
+                       ) AS has_membership,
+                       EXISTS(
+                           SELECT 1 FROM application_actions rejected
+                           WHERE rejected.application_id = a.id
+                             AND rejected.kind = 'platform'
+                             AND rejected.action = 'reject'
+                             AND rejected.status = 'succeeded'
+                       ) AS explicitly_rejected,
+                       (
+                           a.external_checked_at IS NOT NULL
+                           OR EXISTS (
+                               SELECT 1 FROM application_actions approved
+                               WHERE approved.application_id = a.id
+                                 AND approved.kind = 'platform'
+                                 AND approved.action = 'approve'
+                                 AND approved.status IN ('succeeded', 'observed')
+                           )
+                       ) AS has_approval_evidence
+                FROM applications a
+                WHERE a.platform_id = ? AND a.group_id = ?
+                  AND a.applicant_qq != ''
+                ORDER BY a.applicant_qq,
+                         has_open_membership DESC,
+                         a.requested_at DESC,
+                         a.id DESC
+                """,
+                (platform_id, group_id),
+            ).fetchall()
+            applications: list[dict[str, Any]] = []
+            seen_users: set[str] = set()
+            for row in rows:
+                user_id = str(row["applicant_qq"])
+                if user_id in seen_users:
+                    continue
+                seen_users.add(user_id)
+                eligible = bool(row["has_open_membership"]) or (
+                    not bool(row["has_membership"])
+                    and not bool(row["explicitly_rejected"])
+                    and bool(row["has_approval_evidence"])
+                )
+                if not eligible:
+                    continue
+                application = self.application_for_reconciliation(int(row["id"]))
+                if application is not None:
+                    applications.append(application)
+        return applications
 
     def find_application_for_member(
         self,
@@ -648,6 +777,13 @@ class AuditStore:
             self._connection.execute(
                 "UPDATE applications SET answer = ? WHERE id = ?",
                 (answer, application_id),
+            )
+
+    def update_application_nickname(self, application_id: int, nickname: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE applications SET nickname = ? WHERE id = ? AND nickname = ''",
+                (nickname, application_id),
             )
 
     def record_leave(

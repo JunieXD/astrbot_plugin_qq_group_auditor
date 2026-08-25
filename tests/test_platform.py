@@ -12,6 +12,7 @@ from qq_group_auditor.platform import (
     get_group_member_list,
     get_group_question,
     get_group_system_requests,
+    get_user_nickname,
     set_group_card,
     set_group_request,
 )
@@ -403,6 +404,27 @@ async def test_get_group_member_list_normalizes_members_and_skips_invalid_rows()
         {
             "action": "get_group_member_list",
             "group_id": "123",
+            "no_cache": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_user_nickname_uses_stranger_info_without_group_cache():
+    bot = FakeBot()
+    bot.response = {"nickname": " 申请人 "}
+
+    nickname = await get_user_nickname(
+        FakeContext(platforms=[FakePlatform(bot, platform_id="napcat-1")]),
+        user_id="20001",
+        platform_id="napcat-1",
+    )
+
+    assert nickname == "申请人"
+    assert bot.calls == [
+        {
+            "action": "get_stranger_info",
+            "user_id": "20001",
             "no_cache": True,
         }
     ]

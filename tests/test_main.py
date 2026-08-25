@@ -8,8 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from qq_group_auditor.models import GroupMemberSnapshot
-
 
 class MessageChain:
     def __init__(self, chain=None):
@@ -239,7 +237,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.1"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.2"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -569,21 +567,17 @@ async def test_external_approval_sets_card_and_leave_closes_same_audit_record(mo
     async def fake_get_group_question(*args, **kwargs):
         return "你从哪里知道本群？"
 
-    async def fake_get_group_member_info(*args, **kwargs):
-        return module.GroupMemberInfo(
-            nickname="申请人",
-            card="旧名片",
-            join_time=2000,
-            card_changeable=True,
-        )
+    async def fake_get_user_nickname(*args, **kwargs):
+        return "申请人"
 
     async def fake_set_group_card(*args, **kwargs):
         cards.append(kwargs)
 
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
     monkeypatch.setattr(module, "get_group_question", fake_get_group_question)
-    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
+    monkeypatch.setattr(module, "get_user_nickname", fake_get_user_nickname)
     monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    monkeypatch.setattr(module.time, "time", lambda: 1991)
 
     request_event = FakeRequestEvent()
     request_event.message_obj.raw_message["time"] = 1900
@@ -699,20 +693,15 @@ async def test_approved_request_sets_card_without_group_increase_notice(monkeypa
     async def fake_get_group_question(*args, **kwargs):
         return "毕业年份"
 
-    async def fake_get_group_member_info(*args, **kwargs):
-        return module.GroupMemberInfo(
-            nickname="申请人",
-            card="",
-            join_time=2000,
-            card_changeable=True,
-        )
+    async def fake_get_user_nickname(*args, **kwargs):
+        return "申请人"
 
     async def fake_set_group_card(*args, **kwargs):
         cards.append(kwargs)
 
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
     monkeypatch.setattr(module, "get_group_question", fake_get_group_question)
-    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
+    monkeypatch.setattr(module, "get_user_nickname", fake_get_user_nickname)
     monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
     event = FakeRequestEvent()
     event.message_obj.raw_message.update(
@@ -763,6 +752,7 @@ async def test_backfill_updates_historical_card_once_and_is_rerunnable(monkeypat
             sub_type="add",
             requested_at=1900,
             self_id="99999",
+            nickname="申请人",
         ),
         question="毕业年份",
         question_source="config",
@@ -779,21 +769,9 @@ async def test_backfill_updates_historical_card_once_and_is_rerunnable(monkeypat
     )
     cards = []
 
-    async def fake_get_group_member_list(*args, **kwargs):
-        return [
-            GroupMemberSnapshot(
-                user_id="20002",
-                nickname="申请人",
-                card="旧名片",
-                join_time=2000,
-                card_changeable=True,
-            )
-        ]
-
     async def fake_set_group_card(*args, **kwargs):
         cards.append(kwargs)
 
-    monkeypatch.setattr(module, "get_group_member_list", fake_get_group_member_list)
     monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
     event = FakeEvent(message="qgaudit backfill 123")
 
@@ -808,6 +786,123 @@ async def test_backfill_updates_historical_card_once_and_is_rerunnable(monkeypat
     assert record["answer"] == "2028"
     assert len(record["memberships"]) == 1
     assert len(record["memberships"][0]["card_operations"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_direct_failure_is_retriable_without_false_membership(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{answer}-{nickname}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    application_id, _ = plugin.audit_store.record_application(
+        platform_id="napcat-1",
+        request=module.JoinRequest(
+            group_id="123",
+            applicant_qq="20002",
+            answer="2028",
+            flag="historical-failure",
+            sub_type="add",
+            requested_at=1900,
+            nickname="申请人",
+        ),
+        question="毕业年份",
+        question_source="config",
+        review_prompt="规则",
+    )
+    plugin.audit_store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="30001",
+        source="plugin",
+        status="succeeded",
+        occurred_at=1901,
+    )
+    attempts = 0
+
+    async def flaky_set_group_card(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise module.PlatformActionError("member is not in group")
+
+    monkeypatch.setattr(module, "set_group_card", flaky_set_group_card)
+    event = FakeEvent(message="qgaudit backfill 123")
+
+    first = await collect(plugin.qgaudit_backfill(event))
+    assert "设置接口失败（含已退群或权限不足）：1" in first[0]
+    assert plugin.audit_store.detail(
+        group_id="123", application_id=application_id
+    )["memberships"] == []
+
+    second = await collect(plugin.qgaudit_backfill(event))
+    assert "本次修改成功：1" in second[0]
+    assert attempts == 2
+    assert len(
+        plugin.audit_store.detail(group_id="123", application_id=application_id)[
+            "memberships"
+        ]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_request_sets_card_without_member_cache_api(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "auto_set_card": True,
+            "card_template": "{answer}-{nickname}",
+            "application_question": "毕业年份",
+        }
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    cards = []
+
+    async def fake_set_group_request(*args, **kwargs):
+        return None
+
+    async def fake_get_group_question(*args, **kwargs):
+        return "毕业年份"
+
+    async def fake_get_user_nickname(*args, **kwargs):
+        return "申请人"
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module, "get_group_question", fake_get_group_question)
+    monkeypatch.setattr(module, "get_user_nickname", fake_get_user_nickname)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    event = FakeRequestEvent()
+    event.message_obj.raw_message.update(
+        {
+            "comment": "问题：毕业年份\n答案：2028",
+            "time": 1990,
+            "self_id": 99999,
+        }
+    )
+
+    await plugin.handle_group_request(event)
+
+    assert cards == [
+        {
+            "group_id": "123",
+            "user_id": "20002",
+            "card": "2028-申请人",
+            "platform_id": "napcat-1",
+        }
+    ]
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["nickname"] == "申请人"
+    assert record["memberships"][0]["card_operations"][0]["status"] == "succeeded"
+    assert any(
+        action["reason"] == "通过群名片设置接口确认已入群"
+        for action in record["actions"]
+    )
 
 
 @pytest.mark.asyncio
@@ -838,19 +933,10 @@ async def test_reconcile_confirms_external_approval_before_inferring_rejection(m
             }
         ]
 
-    async def fake_get_group_member_info(*args, **kwargs):
-        return module.GroupMemberInfo(
-            nickname="申请人",
-            card="",
-            join_time=910,
-            card_changeable=True,
-        )
-
     async def fake_set_group_card(*args, **kwargs):
         cards.append(kwargs)
 
     monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
-    monkeypatch.setattr(module, "get_group_member_info", fake_get_group_member_info)
     monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
     monkeypatch.setattr(module.time, "time", lambda: 1100)
 
