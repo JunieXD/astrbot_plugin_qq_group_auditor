@@ -240,7 +240,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.5"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.6"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -471,6 +471,116 @@ async def test_group_request_handler_uses_raw_request_event_and_platform_id(
             "platform_id": "napcat-1",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_invite_approve_skips_llm_and_all_automatic_card_paths(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {
+            "invite_action": "approve",
+            "auto_set_card": True,
+            "card_template": "{nickname}-{answer}",
+        }
+    )
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    platform_calls = []
+    cards = []
+
+    async def fake_set_group_request(*args, **kwargs):
+        platform_calls.append(kwargs)
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    async def fake_get_user_nickname(*args, **kwargs):
+        return "受邀成员"
+
+    monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+    monkeypatch.setattr(module, "get_user_nickname", fake_get_user_nickname)
+    event = FakeRequestEvent()
+    event.message_obj.raw_message.update(
+        {"comment": "", "time": 1900, "self_id": 99999}
+    )
+
+    await plugin.handle_group_request(event)
+    await plugin.handle_group_membership_notice(
+        FakeNoticeEvent(
+            {
+                "post_type": "notice",
+                "notice_type": "group_increase",
+                "sub_type": "approve",
+                "group_id": 123,
+                "user_id": 20002,
+                "operator_id": 30001,
+                "self_id": 99999,
+                "time": 2000,
+            }
+        )
+    )
+    await plugin._reconcile_missing_joins("napcat-1", 2001)
+
+    assert context.llm_calls == []
+    assert platform_calls == [
+        {
+            "flag": "flag-1",
+            "sub_type": "add",
+            "approve": True,
+            "reason": "",
+            "platform_id": "napcat-1",
+        }
+    ]
+    assert cards == []
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["request_kind"] == "invite"
+    assert record["memberships"][0]["application_id"] == record["id"]
+    assert {action["source"] for action in record["actions"]} == {
+        "invite_policy",
+        "group_increase",
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_invite_increase_never_sets_group_card(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(
+        {"auto_set_card": True, "card_template": "{nickname}"}
+    )
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    cards = []
+
+    async def fake_get_user_nickname(*args, **kwargs):
+        return "受邀成员"
+
+    async def fake_set_group_card(*args, **kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr(module, "get_user_nickname", fake_get_user_nickname)
+    monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
+
+    await plugin.handle_group_membership_notice(
+        FakeNoticeEvent(
+            {
+                "post_type": "notice",
+                "notice_type": "group_increase",
+                "sub_type": "invite",
+                "group_id": 123,
+                "user_id": 20002,
+                "operator_id": 30001,
+                "self_id": 99999,
+                "time": 2000,
+            }
+        )
+    )
+
+    assert cards == []
+    record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
+    assert record["record_type"] == "join_only"
+    assert record["memberships"][0]["join_sub_type"] == "invite"
 
 
 @pytest.mark.asyncio

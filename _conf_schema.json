@@ -32,6 +32,12 @@
             "default": "ignore",
             "hint": "填写 ignore 或 reject。ignore 表示不处理，reject 表示自动拒绝。"
           },
+          "invite_action": {
+            "description": "受邀入群时动作",
+            "type": "string",
+            "default": "ignore",
+            "hint": "填写 approve、ignore 或 reject。受邀请求不调用 LLM；approve 直接通过且不自动改群名片。NapCat 不提供邀请标记，插件仅将原始申请附言完全为空的请求识别为受邀入群。"
+          },
           "reject_reason": {
             "description": "固定拒绝理由",
             "type": "text",

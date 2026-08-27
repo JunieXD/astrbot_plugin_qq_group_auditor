@@ -54,6 +54,9 @@ class AuditService:
         group_config: dict[str, Any],
         request: JoinRequest,
     ) -> ActionResult:
+        if request.request_kind == "invite":
+            return await self._handle_invited_request(group_config, request)
+
         try:
             decision = await self._decision_for_request(group_config, request)
         except LLMReviewError as exc:
@@ -142,6 +145,91 @@ class AuditService:
         return ActionResult(
             action="ignore",
             reason=decision.reason,
+            review_action="ignore",
+        )
+
+    async def _handle_invited_request(
+        self,
+        group_config: dict[str, Any],
+        request: JoinRequest,
+    ) -> ActionResult:
+        action = str(group_config.get("invite_action") or "ignore")
+        reason = {
+            "approve": "受邀入群策略配置为直接通过",
+            "reject": "受邀入群策略配置为拒绝",
+            "ignore": "受邀入群策略配置为忽略",
+        }.get(action, "受邀入群策略无效，已按忽略处理")
+        if action == "approve":
+            try:
+                await self.platform.set_group_request(request, approve=True, reason="")
+            except Exception as exc:
+                await self._notify_platform_error(group_config, request, "approve", exc)
+                return ActionResult(
+                    action="error",
+                    reason=str(exc),
+                    review_action="approve",
+                    platform_action="approve",
+                    platform_status="failed",
+                )
+            if group_config.get("notify_on_approve", False):
+                await self._notify_safely(
+                    group_config=group_config,
+                    request=request,
+                    title="受邀入群直接通过",
+                    action="approve",
+                    reason=reason,
+                )
+            return ActionResult(
+                action="approve",
+                reason=reason,
+                review_action="approve",
+                platform_action="approve",
+                platform_status="succeeded",
+            )
+
+        if action == "reject":
+            try:
+                await self.platform.set_group_request(
+                    request,
+                    approve=False,
+                    reason=str(group_config.get("reject_reason") or ""),
+                )
+            except Exception as exc:
+                await self._notify_platform_error(group_config, request, "reject", exc)
+                return ActionResult(
+                    action="error",
+                    reason=str(exc),
+                    review_action="reject",
+                    platform_action="reject",
+                    platform_status="failed",
+                )
+            if group_config.get("notify_on_reject", False):
+                await self._notify_safely(
+                    group_config=group_config,
+                    request=request,
+                    title="受邀入群已拒绝",
+                    action="reject",
+                    reason=reason,
+                )
+            return ActionResult(
+                action="reject",
+                reason=reason,
+                review_action="reject",
+                platform_action="reject",
+                platform_status="succeeded",
+            )
+
+        if group_config.get("notify_on_ignore", False):
+            await self._notify_safely(
+                group_config=group_config,
+                request=request,
+                title="受邀入群已忽略",
+                action="ignore",
+                reason=reason,
+            )
+        return ActionResult(
+            action="ignore",
+            reason=reason,
             review_action="ignore",
         )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from qq_group_auditor.audit_store import AuditStore
 from qq_group_auditor.models import GroupMemberDecrease, GroupMemberIncrease, JoinRequest
 
@@ -104,6 +106,88 @@ def test_duplicate_request_join_and_leave_events_are_idempotent(tmp_path):
     assert first_leave[1] is True
     assert duplicate_leave == (first_leave[0], False)
     store.close()
+
+
+def test_invite_application_is_audited_and_excluded_from_all_card_candidates(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    invited = JoinRequest(
+        group_id="123",
+        applicant_qq="20001",
+        answer="",
+        flag="invite-flag",
+        sub_type="add",
+        requested_at=1000,
+        request_kind="invite",
+    )
+    application_id, _ = store.record_application(
+        platform_id="napcat-1",
+        request=invited,
+        question="年级",
+        question_source="config",
+        review_prompt="规则",
+    )
+    store.record_action(
+        application_id=application_id,
+        kind="platform",
+        action="approve",
+        actor_qq="99999",
+        source="invite_policy",
+        status="succeeded",
+        occurred_at=1001,
+    )
+
+    detail = store.detail(group_id="123", application_id=application_id)
+
+    assert detail["request_kind"] == "invite"
+    assert store.application_is_invite(application_id) is True
+    assert store.card_candidate_user_ids(
+        platform_id="napcat-1", group_id="123"
+    ) == []
+    assert store.card_backfill_applications(
+        platform_id="napcat-1", group_id="123"
+    ) == []
+    assert store.pending_join_applications(
+        platform_id="napcat-1",
+        group_ids=["123"],
+        now=1002,
+    ) == []
+    store.close()
+
+
+def test_existing_database_migrates_request_kind_without_losing_rows(tmp_path):
+    database = tmp_path / "audit.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_key TEXT NOT NULL UNIQUE,
+            platform_id TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            applicant_qq TEXT NOT NULL,
+            requested_at INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO applications "
+        "(request_key, platform_id, group_id, applicant_qq, requested_at) "
+        "VALUES ('legacy', 'napcat-1', '123', '20001', 1000)"
+    )
+    connection.commit()
+    connection.close()
+
+    store = AuditStore(database)
+    store.close()
+    connection = sqlite3.connect(database)
+    request_kind = connection.execute(
+        "SELECT request_kind FROM applications WHERE request_key = 'legacy'"
+    ).fetchone()[0]
+    user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    connection.close()
+
+    assert request_kind == "application"
+    assert user_version == 3
 
 
 def test_external_checked_without_join_is_inferred_as_reject(tmp_path):

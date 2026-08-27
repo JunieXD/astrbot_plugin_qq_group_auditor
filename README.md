@@ -20,7 +20,8 @@
 | `group_id` | QQ 群号。 |
 | `review_prompt` | 审核提示词，用来描述什么样的申请答案可以通过。 |
 | `failure_action` | 不通过动作，只能填写 `ignore` 或 `reject`。 |
-| `reject_reason` | 固定拒绝理由，仅在 `failure_action=reject` 时用于平台拒绝消息。 |
+| `invite_action` | 受邀入群动作，可填写 `approve`、`ignore` 或 `reject`，默认 `ignore`。 |
+| `reject_reason` | 固定拒绝理由，在 `failure_action=reject` 或 `invite_action=reject` 时用于平台拒绝消息。 |
 | `admin_qq_ids` | 管理员 QQ 号列表，用于接收异常通知，也用于私聊测试命令权限校验。 |
 | `notify_on_approve` | 正常自动通过时是否通知管理员。 |
 | `notify_on_reject` | 正常自动拒绝时是否通知管理员。 |
@@ -53,6 +54,8 @@
 只有该群 `admin_qq_ids` 中的 QQ 可以查询。申请答案可能包含个人信息，不支持在群聊中查询。
 
 NapCat 当前群系统消息接口只能说明申请是否已处理以及操作者，不能区分其他管理员执行的拒绝和忽略。插件按照统一规则，将“已处理但未观察到实际入群”的外部操作记录为 `reject`，并标记来源为 `external_inferred`。
+
+受邀入群请求会保存为独立的 `invite` 类型申请，策略处理流水来源标记为 `invite_policy`。即使 `auto_set_card` 已开启，受邀成员也不会被实时补偿、定时补偿或 `/qgaudit backfill` 修改群名片。
 
 插件启动、更新或重新启用后，会通过群系统消息同步补审停机期间遗漏且平台仍明确标记为“未处理”的申请。已经被任何管理员处理、已有插件审核流水、所属群当前停用或属于邀请类的记录不会补审；实时事件与补审使用同一申请锁，避免重复调用 LLM 或审批接口。每轮最多补审 10 条，每次实际调用 QQ 审批接口前随机等待 2 至 5 秒，单条异常不会中断其他申请。补审产生的流水来源标记为 `plugin_catch_up`。
 
@@ -136,7 +139,19 @@ LLM 输出格式必须是 JSON：
 
 ## 空答案处理
 
-空答案不会调用 LLM。插件会直接按该群配置的 `ignore` 或 `reject` 处理，避免把无意义内容发送给模型。
+普通申请中有问题文本但答案为空时不会调用 LLM，插件会直接按该群配置的 `failure_action` 处理，避免把无意义内容发送给模型。
+
+## 受邀入群处理
+
+`invite_action` 为每个群单独控制受邀入群请求：
+
+- `approve`：直接通过，不调用 LLM，也不自动修改该成员的群名片。
+- `ignore`：不调用平台审批接口，保留给管理员手动处理；这是默认值。
+- `reject`：直接拒绝，不调用 LLM，拒绝消息使用 `reject_reason`。
+
+三种动作分别复用 `notify_on_approve`、`notify_on_ignore`、`notify_on_reject` 决定是否私聊通知管理员。
+
+NapCat 当前把“群成员邀请他人且需要管理员确认”的实时事件发送成普通 `sub_type=add`，不提供邀请者或请求类型字段，同时也不在 `get_group_system_msg` 中返回这类通知。插件因此仅在“原始申请附言完全为空”时将事件识别为受邀入群。`问题：年级\n答案：` 这类仍属于普通空答案；如果群允许主动申请时把整段验证信息留空，平台数据本身无法与受邀入群区分，也会按 `invite_action` 处理。
 
 ## 管理员通知
 

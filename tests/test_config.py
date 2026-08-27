@@ -25,6 +25,7 @@ def test_normalize_config_preserves_template_list_and_coerces_scalars():
                     "group_id": 123456,
                     "review_prompt": "答案必须包含 AutoEmailSender",
                     "failure_action": "reject",
+                    "invite_action": "approve",
                     "reject_reason": "",
                     "admin_qq_ids": [10001, "10002", ""],
                     "notify_on_approve": True,
@@ -41,6 +42,7 @@ def test_normalize_config_preserves_template_list_and_coerces_scalars():
     assert item["reject_reason"] == DEFAULT_REJECT_REASON
     assert item["admin_qq_ids"] == ["10001", "10002"]
     assert item["failure_action"] == "reject"
+    assert item["invite_action"] == "approve"
     assert item["audit_log_enabled"] is True
     assert item["auto_set_card"] is False
     assert item["card_template"] == "{nickname}"
@@ -61,6 +63,20 @@ def test_invalid_failure_action_defaults_to_ignore():
     )
 
     assert config["group_audits"][0]["failure_action"] == "ignore"
+
+
+def test_missing_and_invalid_invite_action_default_to_ignore():
+    config = normalize_config(
+        {
+            "group_audits": [
+                {"group_id": "1"},
+                {"group_id": "2", "invite_action": "delete"},
+            ]
+        }
+    )
+
+    assert config["group_audits"][0]["invite_action"] == "ignore"
+    assert config["group_audits"][1]["invite_action"] == "ignore"
 
 
 def test_empty_review_prompt_uses_default():

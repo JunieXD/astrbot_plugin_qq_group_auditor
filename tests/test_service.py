@@ -49,6 +49,7 @@ def group_config(**overrides):
         "enabled": True,
         "review_prompt": "规则",
         "failure_action": "ignore",
+        "invite_action": "ignore",
         "reject_reason": "请重新申请",
         "admin_qq_ids": ["10001"],
         "notify_on_approve": False,
@@ -66,6 +67,17 @@ def request(answer: str = "答案") -> JoinRequest:
         answer=answer,
         flag="flag",
         sub_type="add",
+    )
+
+
+def invited_request() -> JoinRequest:
+    return JoinRequest(
+        group_id="123",
+        applicant_qq="20001",
+        answer="",
+        flag="invite-flag",
+        sub_type="add",
+        request_kind="invite",
     )
 
 
@@ -131,6 +143,56 @@ async def test_empty_answer_skips_reviewer_and_follows_failure_action():
     assert result.action == "reject"
     assert reviewer.calls == 0
     assert platform.actions == [(request("   "), False, "请重新申请")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "approve", "notice_switch", "title"),
+    [
+        ("approve", True, "notify_on_approve", "受邀入群直接通过"),
+        ("reject", False, "notify_on_reject", "受邀入群已拒绝"),
+        ("ignore", None, "notify_on_ignore", "受邀入群已忽略"),
+    ],
+)
+async def test_invite_policy_skips_llm_and_uses_matching_notice_switch(
+    action,
+    approve,
+    notice_switch,
+    title,
+):
+    reviewer = FakeReviewer(ReviewDecision(True, "不会调用"))
+    platform = FakePlatform()
+    notifier = FakeNotifier()
+    config = group_config(invite_action=action, **{notice_switch: True})
+
+    result = await AuditService(reviewer, platform, notifier).handle_request(
+        config,
+        invited_request(),
+    )
+
+    assert result.action == action
+    assert reviewer.calls == 0
+    if approve is None:
+        assert platform.actions == []
+    else:
+        expected_reason = "" if approve else "请重新申请"
+        assert platform.actions == [(invited_request(), approve, expected_reason)]
+    assert notifier.notices[0][1].startswith(f"{title}|{action}|")
+
+
+@pytest.mark.asyncio
+async def test_invite_policy_defaults_to_ignore_when_value_is_invalid():
+    reviewer = FakeReviewer(ReviewDecision(True, "不会调用"))
+    platform = FakePlatform()
+
+    result = await AuditService(reviewer, platform, FakeNotifier()).handle_request(
+        group_config(invite_action="invalid"),
+        invited_request(),
+    )
+
+    assert result.action == "ignore"
+    assert reviewer.calls == 0
+    assert platform.actions == []
 
 
 @pytest.mark.asyncio

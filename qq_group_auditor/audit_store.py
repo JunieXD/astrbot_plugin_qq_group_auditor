@@ -57,6 +57,7 @@ class AuditStore:
             answer TEXT NOT NULL DEFAULT '',
             raw_comment TEXT NOT NULL DEFAULT '',
             review_prompt TEXT NOT NULL DEFAULT '',
+            request_kind TEXT NOT NULL DEFAULT 'application',
             external_checked_at INTEGER,
             external_actor_qq TEXT NOT NULL DEFAULT ''
         );
@@ -130,7 +131,18 @@ class AuditStore:
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
-            self._connection.execute("PRAGMA user_version = 2")
+            application_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(applications)"
+                ).fetchall()
+            }
+            if "request_kind" not in application_columns:
+                self._connection.execute(
+                    "ALTER TABLE applications ADD COLUMN "
+                    "request_kind TEXT NOT NULL DEFAULT 'application'"
+                )
+            self._connection.execute("PRAGMA user_version = 3")
 
     def close(self) -> None:
         with self._lock:
@@ -167,6 +179,7 @@ class AuditStore:
             request.answer,
             request.raw_comment or request.answer,
             review_prompt,
+            "invite" if request.request_kind == "invite" else "application",
         )
         with self._lock, self._connection:
             cursor = self._connection.execute(
@@ -174,12 +187,18 @@ class AuditStore:
                 INSERT OR IGNORE INTO applications (
                     request_key, platform_id, self_id, group_id, applicant_qq,
                     requested_at, observed_at, nickname, question, question_source,
-                    answer, raw_comment, review_prompt
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    answer, raw_comment, review_prompt, request_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
             created = cursor.rowcount == 1
+            if request.request_kind == "invite":
+                self._connection.execute(
+                    "UPDATE applications SET request_kind = 'invite' "
+                    "WHERE request_key = ?",
+                    (key,),
+                )
             row = self._connection.execute(
                 "SELECT id FROM applications WHERE request_key = ?",
                 (key,),
@@ -570,6 +589,7 @@ class AuditStore:
         sql = f"""
             SELECT a.id FROM applications a
             WHERE a.platform_id = ? AND a.group_id IN ({placeholders})
+              AND a.request_kind != 'invite'
               AND MAX(
                   COALESCE((
                       SELECT MAX(approved.occurred_at)
@@ -629,6 +649,7 @@ class AuditStore:
                 """
                 SELECT DISTINCT applicant_qq FROM applications
                 WHERE platform_id = ? AND group_id = ? AND applicant_qq != ''
+                  AND request_kind != 'invite'
                 ORDER BY applicant_qq
                 """,
                 (platform_id, group_id),
@@ -674,6 +695,7 @@ class AuditStore:
                 FROM applications a
                 WHERE a.platform_id = ? AND a.group_id = ?
                   AND a.applicant_qq != ''
+                  AND a.request_kind != 'invite'
                 ORDER BY a.applicant_qq,
                          has_open_membership DESC,
                          a.requested_at DESC,
@@ -812,6 +834,14 @@ class AuditStore:
                 (membership_id,),
             ).fetchone()
         return row is not None
+
+    def application_is_invite(self, application_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT request_kind FROM applications WHERE id = ?",
+                (application_id,),
+            ).fetchone()
+        return bool(row and row["request_kind"] == "invite")
 
     def update_application_answer(self, application_id: int, answer: str) -> None:
         with self._lock, self._connection:

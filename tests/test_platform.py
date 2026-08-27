@@ -112,6 +112,44 @@ def test_extract_join_request_from_onebot_add_request():
     assert request.requested_at == 1234567890
     assert request.self_id == "99999"
     assert request.raw_comment == "AutoEmailSender"
+    assert request.request_kind == "application"
+
+
+def test_extract_join_request_treats_only_fully_empty_comment_as_invite():
+    invited_event = FakeEvent(
+        RawEvent(
+            {
+                "post_type": "request",
+                "request_type": "group",
+                "sub_type": "add",
+                "group_id": 123456,
+                "user_id": 10001,
+                "comment": "",
+                "flag": "invite-1",
+            }
+        )
+    )
+    empty_answer_event = FakeEvent(
+        RawEvent(
+            {
+                "post_type": "request",
+                "request_type": "group",
+                "sub_type": "add",
+                "group_id": 123456,
+                "user_id": 10002,
+                "comment": "问题：年级\n答案：",
+                "flag": "application-1",
+            }
+        )
+    )
+
+    invited = extract_join_request(invited_event)
+    empty_answer = extract_join_request(empty_answer_event)
+
+    assert invited.request_kind == "invite"
+    assert invited.answer == ""
+    assert empty_answer.request_kind == "application"
+    assert empty_answer.answer == ""
 
 
 def test_onebot_platform_ids_uses_first_stable_identifier():

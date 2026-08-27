@@ -326,7 +326,7 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.5")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.6")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -404,7 +404,9 @@ class QQGroupAuditorPlugin(Star):
             application_id=application_id,
             platform_id=platform_id,
             unified_msg_origin=getattr(event, "unified_msg_origin", None),
-            action_source="plugin",
+            action_source=(
+                "invite_policy" if request.request_kind == "invite" else "plugin"
+            ),
         )
 
     async def _review_application(
@@ -484,6 +486,7 @@ class QQGroupAuditorPlugin(Star):
             result.platform_action == "approve"
             and result.platform_status == "succeeded"
             and group_config.get("auto_set_card", False)
+            and request.request_kind != "invite"
         ):
             confirmed = await self._reconcile_application_member(application_id)
             if confirmed in {None, "failed", "not_in_group"}:
@@ -518,6 +521,7 @@ class QQGroupAuditorPlugin(Star):
             group_config.get("auto_set_card", False)
             and needs_nickname
             and not request.nickname
+            and request.request_kind != "invite"
         ):
             try:
                 nickname = await get_user_nickname(
@@ -583,7 +587,11 @@ class QQGroupAuditorPlugin(Star):
                 actor_qq=request.self_id,
                 source=source,
                 status="observed",
-                reason="配置为 ignore，未调用平台审批接口",
+                reason=(
+                    result.reason
+                    if source == "invite_policy"
+                    else "配置为 ignore，未调用平台审批接口"
+                ),
             )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -693,6 +701,13 @@ class QQGroupAuditorPlugin(Star):
                 group_config.get("enabled", True)
                 and group_config.get("auto_set_card", False)
             )
+            invited_membership = increase.sub_type == "invite" or (
+                self.audit_store is not None
+                and application_id is not None
+                and self.audit_store.application_is_invite(application_id)
+            )
+            if invited_membership:
+                return "invited"
             if not auto_card_enabled:
                 return "disabled"
             if not created and not force_card:
@@ -871,6 +886,8 @@ class QQGroupAuditorPlugin(Star):
         user_id = str(application.get("applicant_qq") or "")
         platform_id = str(application.get("platform_id") or "aiocqhttp")
         application_id = int(application["id"])
+        if application.get("request_kind") == "invite":
+            return "invited"
         if self.audit_store.has_successful_card_attempt(application_id):
             return "already_done"
         if (
@@ -1089,6 +1106,7 @@ class QQGroupAuditorPlugin(Star):
             or not group_config.get("auto_set_card", False)
             or not group_id
             or not user_id
+            or application.get("request_kind") == "invite"
         ):
             return None
         return await self._set_card_from_application(

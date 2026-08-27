@@ -31,6 +31,17 @@ def _action_summary(actions: list[dict[str, Any]]) -> str:
     return "; ".join(parts)
 
 
+def _request_type(record: dict[str, Any]) -> str:
+    memberships = record.get("memberships") or []
+    if record.get("request_kind") == "invite" or any(
+        membership.get("join_sub_type") == "invite" for membership in memberships
+    ):
+        return "受邀入群"
+    if record.get("record_type") == "join_only":
+        return "仅观察到入群"
+    return "主动申请"
+
+
 def format_history(records: list[dict[str, Any]]) -> str:
     if not records:
         return "没有找到申请记录"
@@ -43,6 +54,7 @@ def format_history(records: list[dict[str, Any]]) -> str:
             f"{'入群' if is_join_only else '申请'}记录 #{record['id']}  "
             f"{'入群' if is_join_only else '申请'}时间：{format_time(record.get('requested_at'))}",
             f"QQ：{record.get('applicant_qq')}",
+            f"类型：{_request_type(record)}",
             f"问题：{summarize_text(record.get('question') or '', 120) or '(未知)'}",
             f"答案：{summarize_text(record.get('answer') or '', 240) or '(空)'}",
             f"处理：{_action_summary(record.get('actions') or [])}",
@@ -69,6 +81,7 @@ def format_detail(record: dict[str, Any] | None) -> str:
         f"{'入群' if is_join_only else '申请'}记录 #{record['id']}",
         f"群号：{record.get('group_id')}",
         f"QQ：{record.get('applicant_qq')}",
+        f"类型：{_request_type(record)}",
         f"申请昵称：{record.get('nickname') or '(未知)'}",
         f"申请时间：{format_time(record.get('requested_at'))}",
         f"问题：{record.get('question') or '(未知)'}",

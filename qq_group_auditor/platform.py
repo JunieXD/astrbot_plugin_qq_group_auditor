@@ -24,6 +24,25 @@ def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
     return getattr(raw, key, default)
 
 
+def _is_invited_member_request(raw: Any, raw_comment: str) -> bool:
+    """Detect NapCat's member-invitation request using the narrowest available hint.
+
+    NapCat currently emits both a direct application and a member invitation that
+    needs administrator approval as ``sub_type=add``.  The latter has no dedicated
+    OneBot field, but its original comment is empty.  Future adapter-specific
+    inviter fields are also accepted when available.
+    """
+    inviter_qq = next(
+        (
+            str(_raw_get(raw, key) or "").strip()
+            for key in ("invitor_uin", "invitor_id", "inviter_id")
+            if str(_raw_get(raw, key) or "").strip()
+        ),
+        "",
+    )
+    return bool(inviter_qq) or not raw_comment
+
+
 def extract_join_request(event: Any) -> JoinRequest | None:
     raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
     if raw is None:
@@ -56,6 +75,9 @@ def extract_join_request(event: Any) -> JoinRequest | None:
         requested_at=requested_at,
         self_id=self_id,
         raw_comment=raw_comment,
+        request_kind=(
+            "invite" if _is_invited_member_request(raw, raw_comment) else "application"
+        ),
     )
 
 

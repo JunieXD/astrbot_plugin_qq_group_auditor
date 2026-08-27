@@ -11,6 +11,7 @@ DEFAULT_REVIEW_PROMPT = (
 DEFAULT_CARD_TEMPLATE = "{nickname}"
 DEFAULT_CONFIG = {"group_audits": []}
 VALID_FAILURE_ACTIONS = {"ignore", "reject"}
+VALID_INVITE_ACTIONS = {"approve", "ignore", "reject"}
 TRUE_STRINGS = {"true", "1", "yes", "on"}
 FALSE_STRINGS = {"false", "0", "no", "off", ""}
 
@@ -53,6 +54,10 @@ def normalize_group_item(item: dict[str, Any]) -> dict[str, Any] | None:
     if failure_action not in VALID_FAILURE_ACTIONS:
         failure_action = "ignore"
 
+    invite_action = str(item.get("invite_action") or "ignore").strip().lower()
+    if invite_action not in VALID_INVITE_ACTIONS:
+        invite_action = "ignore"
+
     reject_reason = str(item.get("reject_reason") or "").strip() or DEFAULT_REJECT_REASON
 
     return {
@@ -62,6 +67,7 @@ def normalize_group_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "review_prompt": str(item.get("review_prompt") or "").strip()
         or DEFAULT_REVIEW_PROMPT,
         "failure_action": failure_action,
+        "invite_action": invite_action,
         "reject_reason": reject_reason,
         "admin_qq_ids": normalize_admin_ids(item.get("admin_qq_ids")),
         "notify_on_approve": normalize_bool(item.get("notify_on_approve")),

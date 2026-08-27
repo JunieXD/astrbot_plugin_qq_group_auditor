@@ -37,11 +37,12 @@ def format_notice(
         title,
         f"群号：{request.group_id}",
         f"申请人：{request.applicant_qq}",
+        f"类型：{'受邀入群' if request.request_kind == 'invite' else '主动申请'}",
         f"动作：{action}",
         f"答案：{summarize_text(request.answer, 160) or '(空)'}",
     ]
     if reason:
-        lines.append(f"LLM理由：{reason}")
+        lines.append(f"处理理由：{reason}")
     if error:
         lines.append(f"错误：{error}")
     return "\n".join(lines)

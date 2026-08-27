@@ -5,6 +5,8 @@ from typing import Literal
 
 
 FailureAction = Literal["ignore", "reject"]
+InviteAction = Literal["approve", "ignore", "reject"]
+RequestKind = Literal["application", "invite"]
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,7 @@ class GroupAuditConfig:
     enabled: bool
     review_prompt: str
     failure_action: FailureAction
+    invite_action: InviteAction
     reject_reason: str
     admin_qq_ids: tuple[str, ...]
     notify_on_approve: bool
@@ -42,6 +45,7 @@ class JoinRequest:
     question: str = ""
     nickname: str = ""
     raw_comment: str = ""
+    request_kind: RequestKind = "application"
 
 
 @dataclass(frozen=True)
