@@ -19,6 +19,37 @@ def request(flag: str, requested_at: int, answer: str) -> JoinRequest:
     )
 
 
+def test_answer_enrichment_preserves_reviewed_history(tmp_path):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+
+    def record(answer):
+        return store.record_application(
+            platform_id="napcat-1", request=request("same", 1000, answer),
+            question="问题", question_source="config", review_prompt="规则",
+        )
+
+    application_id, _ = record("")
+    assert record("github") == (application_id, False)
+    assert store.detail(group_id="123", application_id=application_id)["answer"] == "github"
+    record("")
+    assert store.detail(group_id="123", application_id=application_id)["answer"] == "github"
+
+    reviewed_id, _ = store.record_application(
+        platform_id="napcat-1", request=request("already-reviewed", 1000, ""),
+        question="问题", question_source="config", review_prompt="规则",
+    )
+    store.record_action(
+        application_id=reviewed_id, kind="review", action="ignore", actor_qq="99999",
+        source="plugin", status="completed", reason="申请答案为空",
+    )
+    store.record_application(
+        platform_id="napcat-1", request=request("already-reviewed", 1000, "github"),
+        question="问题", question_source="config", review_prompt="规则",
+    )
+    assert store.detail(group_id="123", application_id=reviewed_id)["answer"] == ""
+    store.close()
+
+
 def test_repeated_applications_and_memberships_are_kept_as_separate_history(tmp_path):
     store = AuditStore(tmp_path / "audit.sqlite3")
     first_id, first_created = store.record_application(

@@ -1428,6 +1428,198 @@ async def test_realtime_and_catch_up_share_review_lock(monkeypatch):
     assert results[1] is None
 
 
+@pytest.fixture
+def empty_answer_runtime(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    context = FakeContext()
+    config = plugin_config()
+    config["group_audits"][0].update(notify_on_ignore=True, notify_on_reject=True)
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sleep = asyncio.sleep
+    delays, approvals, notices = [], [], []
+
+    async def controlled_sleep(delay):
+        if delay == module._EMPTY_ANSWER_WAIT_SECONDS:
+            delays.append(delay)
+            entered.set()
+            await release.wait()
+        else:
+            await sleep(delay)
+
+    async def approve(*args, **kwargs):
+        approvals.append(kwargs)
+
+    async def notify(*args, **kwargs):
+        notices.append(args[2])
+
+    async def question(*args, **kwargs):
+        return "从何得知该项目的"
+
+    monkeypatch.setattr(module.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(module, "set_group_request", approve)
+    monkeypatch.setattr(module, "send_admin_notice", notify)
+    monkeypatch.setattr(module, "get_group_question", question)
+    return types.SimpleNamespace(
+        module=module, plugin=plugin, context=context, entered=entered,
+        release=release, delays=delays, approvals=approvals, notices=notices,
+    )
+
+
+def empty_request_event(flag="empty-first"):
+    event = FakeRequestEvent()
+    event.message_obj.raw_message.update(
+        flag=flag, comment="问题：从何得知该项目的\n答案："
+    )
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_flag", [False, True])
+@pytest.mark.parametrize("audit_enabled", [False, True])
+async def test_empty_answer_wait_replaced_by_answer(
+    empty_answer_runtime, same_flag, audit_enabled
+):
+    env = empty_answer_runtime
+    plugin = env.plugin
+    if not audit_enabled:
+        plugin.audit_store.close()
+        plugin.audit_store = None
+    first = empty_request_event()
+    await plugin.handle_group_request(first)
+    await env.entered.wait()
+    tasks = list(plugin._empty_answer_tasks)
+    assert env.delays == [30]
+    assert not env.context.llm_calls and not env.approvals and not env.notices
+
+    second = empty_request_event("empty-first" if same_flag else "answer-second")
+    second.message_obj.raw_message["comment"] += "github"
+    await plugin.handle_group_request(second)
+    env.release.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    # Replayed old flags cannot trigger catch-up processing after replacement.
+    if audit_enabled and not same_flag:
+        await plugin.handle_group_request(first)
+    assert len(env.context.llm_calls) == 1
+    assert len(env.approvals) == 1
+    assert env.approvals[0]["flag"] == second.message_obj.raw_message["flag"]
+    assert env.approvals[0]["approve"] is True
+    assert not env.notices and not plugin._pending_empty_reviews
+    if audit_enabled:
+        records = plugin.audit_store.history(group_id="123", applicant_qq="20002")
+        assert records[0]["answer"] == "github"
+        if not same_flag:
+            assert [a["action"] for a in records[1]["actions"]] == ["superseded"]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_action", ["ignore", "reject"])
+async def test_empty_answer_timeout_handles_latest_request_once(
+    empty_answer_runtime, failure_action
+):
+    env = empty_answer_runtime
+    plugin = env.plugin
+    plugin.config["group_audits"][0]["failure_action"] = failure_action
+    await plugin.handle_group_request(empty_request_event())
+    await env.entered.wait()
+    await plugin.handle_group_request(empty_request_event())
+    await plugin.handle_group_request(empty_request_event("empty-second"))
+    # A catch-up poll must join the same waiting window.
+    await plugin._review_application(
+        group_config=plugin.config["group_audits"][0],
+        request=env.module.extract_join_request(empty_request_event("empty-second")),
+        application_id=plugin.audit_store.get_application_id_by_flag(
+            platform_id="napcat-1", self_id="", flag="empty-second"
+        ),
+        platform_id="napcat-1", unified_msg_origin=None, action_source="plugin_catch_up",
+    )
+    assert env.delays == [30] and not env.notices and not env.approvals
+    env.release.set()
+    await asyncio.gather(*list(plugin._empty_answer_tasks))
+    assert not env.context.llm_calls
+    assert len(env.notices) == 1
+    assert "申请答案为空" in env.notices[0]
+    if failure_action == "reject":
+        assert len(env.approvals) == 1
+        assert env.approvals[0]["flag"] == "empty-second"
+        assert env.approvals[0]["approve"] is False
+    else:
+        assert not env.approvals
+    records = plugin.audit_store.history(group_id="123", applicant_qq="20002")
+    assert records[1]["actions"][0]["action"] == "superseded"
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_wait_is_scoped_and_cancelled_on_unload(empty_answer_runtime):
+    env = empty_answer_runtime
+    plugin = env.plugin
+    await plugin.handle_group_request(empty_request_event())
+    await env.entered.wait()
+    other = empty_request_event("other-applicant")
+    other.message_obj.raw_message.update(user_id=30003, comment="github")
+    await plugin.handle_group_request(other)
+    assert len(plugin._pending_empty_reviews) == 1
+    tasks = list(plugin._empty_answer_tasks)
+    await plugin.terminate()
+    env.release.set()
+    assert all(task.cancelled() for task in tasks)
+    assert not plugin._pending_empty_reviews and not plugin._empty_answer_tasks
+    assert not env.notices
+    assert len(env.approvals) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["group", "platform"])
+async def test_answer_from_other_scope_does_not_cancel_wait(empty_answer_runtime, scope):
+    env = empty_answer_runtime
+    plugin = env.plugin
+    await plugin.handle_group_request(empty_request_event())
+    await env.entered.wait()
+    event = empty_request_event("other-scope")
+    event.message_obj.raw_message["comment"] += "github"
+    if scope == "group":
+        event.message_obj.raw_message["group_id"] = 456
+        plugin.config["group_audits"].append(
+            {**plugin.config["group_audits"][0], "group_id": "456"}
+        )
+    else:
+        event.get_platform_id = lambda: "napcat-other"
+    await plugin.handle_group_request(event)
+    assert len(plugin._pending_empty_reviews) == 1
+    env.release.set()
+    await asyncio.gather(*list(plugin._empty_answer_tasks))
+    assert len(env.approvals) == 1 and len(env.notices) == 1
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_invite_policy_does_not_wait_for_answer(empty_answer_runtime):
+    env = empty_answer_runtime
+    env.plugin.config["group_audits"][0]["invite_action"] = "approve"
+    event = empty_request_event()
+    event.message_obj.raw_message["comment"] = ""
+    await env.plugin.handle_group_request(event)
+    assert not env.plugin._pending_empty_reviews
+    assert not env.delays and not env.context.llm_calls
+    assert len(env.approvals) == 1
+    await env.plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_disabled_group_is_not_reviewed_after_wait(empty_answer_runtime):
+    env = empty_answer_runtime
+    await env.plugin.handle_group_request(empty_request_event())
+    await env.entered.wait()
+    env.plugin.config["group_audits"][0]["enabled"] = False
+    env.release.set()
+    await asyncio.gather(*list(env.plugin._empty_answer_tasks))
+    assert not env.notices and not env.approvals
+    await env.plugin.terminate()
+
+
 @pytest.mark.asyncio
 async def test_reconcile_loop_discovers_active_platform_with_empty_database(monkeypatch):
     module, _ = import_main(monkeypatch)

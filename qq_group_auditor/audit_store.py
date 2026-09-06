@@ -193,6 +193,19 @@ class AuditStore:
                 values,
             )
             created = cursor.rowcount == 1
+            if not created and request.answer.strip():
+                # Some adapters enrich an existing flag instead of emitting a new one.
+                self._connection.execute(
+                    """
+                    UPDATE applications SET answer = ?, raw_comment = ?
+                    WHERE request_key = ? AND TRIM(answer) = ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM application_actions
+                          WHERE application_id = applications.id AND kind = 'review'
+                      )
+                    """,
+                    (request.answer, request.raw_comment or request.answer, key),
+                )
             if request.request_kind == "invite":
                 self._connection.execute(
                     "UPDATE applications SET request_kind = 'invite' "

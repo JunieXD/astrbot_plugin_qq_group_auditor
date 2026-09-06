@@ -6,7 +6,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +91,7 @@ _CARD_ACTION_DELAY_RANGE_SECONDS = (0.8, 2.2)
 _CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (2.0, 5.0)
 _MAX_AUTOMATIC_CARD_ATTEMPTS = 5
 _MAX_CATCH_UP_REVIEWS_PER_CYCLE = 10
+_EMPTY_ANSWER_WAIT_SECONDS = 30
 _PLUGIN_NAME = "astrbot_plugin_qq_group_auditor"
 
 
@@ -326,6 +327,12 @@ def _tracks_requests(group_config: dict[str, Any]) -> bool:
     )
 
 
+@dataclass
+class _PendingEmptyReview:
+    requests: dict[str, tuple[JoinRequest, int | None]] = field(default_factory=dict)
+    task: asyncio.Task[None] | None = None
+
+
 @register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.6")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
@@ -335,6 +342,8 @@ class QQGroupAuditorPlugin(Star):
         self._reconcile_task: asyncio.Task[None] | None = None
         self._application_tasks: dict[int, asyncio.Task[None]] = {}
         self._review_locks: dict[int, asyncio.Lock] = {}
+        self._pending_empty_reviews: dict[tuple[str, str, str], _PendingEmptyReview] = {}
+        self._empty_answer_tasks: set[asyncio.Task[None]] = set()
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._card_attempt_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
@@ -349,6 +358,13 @@ class QQGroupAuditorPlugin(Star):
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
     async def terminate(self) -> None:
+        empty_tasks = list(self._empty_answer_tasks)
+        self._pending_empty_reviews.clear()
+        for task in empty_tasks:
+            task.cancel()
+        if empty_tasks:
+            await asyncio.gather(*empty_tasks, return_exceptions=True)
+        self._empty_answer_tasks.clear()
         if self._reconcile_task is not None:
             self._reconcile_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -410,6 +426,106 @@ class QQGroupAuditorPlugin(Star):
         )
 
     async def _review_application(
+        self,
+        *,
+        group_config: dict[str, Any],
+        request: JoinRequest,
+        application_id: int | None,
+        platform_id: str | None,
+        unified_msg_origin: str | None,
+        action_source: str,
+    ) -> ActionResult | None:
+        kwargs = dict(
+            group_config=group_config,
+            request=request,
+            application_id=application_id,
+            platform_id=platform_id,
+            unified_msg_origin=unified_msg_origin,
+            action_source=action_source,
+        )
+        if request.request_kind == "invite":
+            return await self._review_application_now(**kwargs)
+        if (
+            application_id is not None
+            and self.audit_store is not None
+            and self.audit_store.has_review_action(application_id)
+        ):
+            return None
+        key = (platform_id or "aiocqhttp", request.group_id, request.applicant_qq)
+        pending = self._pending_empty_reviews.get(key)
+        if request.answer.strip():
+            if pending is not None:
+                self._pending_empty_reviews.pop(key)
+                if pending.task is not None:
+                    pending.task.cancel()
+                self._supersede_empty_reviews(pending, request, application_id)
+            return await self._review_application_now(**kwargs)
+
+        if pending is not None:
+            # Repeated empty events do not extend the first event's deadline.
+            pending.requests[request.flag] = (request, application_id)
+            return None
+        pending = _PendingEmptyReview(requests={request.flag: (request, application_id)})
+        self._pending_empty_reviews[key] = pending
+
+        async def wait_for_answer() -> None:
+            await asyncio.sleep(_EMPTY_ANSWER_WAIT_SECONDS)
+            if self._pending_empty_reviews.get(key) is not pending:
+                return
+            self._pending_empty_reviews.pop(key)
+            latest_request, latest_id = list(pending.requests.values())[-1]
+            self._supersede_empty_reviews(pending, latest_request, latest_id)
+            current_config = find_group_config(self.config, latest_request.group_id)
+            if current_config is None:
+                return
+            await self._review_application_now(
+                **{
+                    **kwargs,
+                    "group_config": current_config,
+                    "request": latest_request,
+                    "application_id": latest_id,
+                }
+            )
+
+        task = asyncio.create_task(wait_for_answer())
+        pending.task = task
+        self._empty_answer_tasks.add(task)
+
+        def completed(done: asyncio.Task[None]) -> None:
+            self._empty_answer_tasks.discard(done)
+            if self._pending_empty_reviews.get(key) is pending:
+                self._pending_empty_reviews.pop(key)
+            if not done.cancelled() and done.exception() is not None:
+                logger.warning("failed to review pending empty answer: %s", done.exception())
+
+        task.add_done_callback(completed)
+        return None
+
+    def _supersede_empty_reviews(
+        self,
+        pending: _PendingEmptyReview,
+        replacement: JoinRequest,
+        replacement_id: int | None,
+    ) -> None:
+        if self.audit_store is None:
+            return
+        for previous, previous_id in pending.requests.values():
+            if previous_id is None or previous_id == replacement_id:
+                continue
+            self.audit_store.record_action(
+                application_id=previous_id,
+                kind="review",
+                action="superseded",
+                actor_qq=previous.self_id,
+                source="empty_answer_wait",
+                status="completed",
+                reason=(
+                    f"等待期间收到{'有答案的' if replacement.answer.strip() else '新的空答案'}申请"
+                    f"（记录 #{replacement_id}），旧请求不再审批或通知"
+                ),
+            )
+
+    async def _review_application_now(
         self,
         *,
         group_config: dict[str, Any],
