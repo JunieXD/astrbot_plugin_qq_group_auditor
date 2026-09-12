@@ -125,6 +125,18 @@ def import_main(monkeypatch: pytest.MonkeyPatch):
     module = importlib.import_module("main")
     module._CARD_ACTION_DELAY_RANGE_SECONDS = (0.0, 0.0)
     module._CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (0.0, 0.0)
+    module._JOIN_CONFIRM_RETRY_DELAYS = (0, 0, 0)
+    async def online(*args, **kwargs):
+        return True
+    module.is_onebot_online = online
+    class ImmediateGuard:
+        deferred_error = module.ActionDeferred
+        async def run(self, **kwargs):
+            return await kwargs["action"]()
+    monkeypatch.setattr(module, "get_guard", lambda *args: ImmediateGuard())
+    async def member_info(*args, **kwargs):
+        return module.GroupMemberInfo(nickname="", card="", join_time=0)
+    monkeypatch.setattr(module, "get_group_member_info", member_info)
     return module, command_groups
 
 
@@ -240,7 +252,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.6"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.7"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -1245,7 +1257,10 @@ async def test_catch_up_waits_before_platform_approval(monkeypatch):
     async def fake_set_group_request(*args, **kwargs):
         events.append(("approve", kwargs["flag"]))
 
-    monkeypatch.setattr(module, "_catch_up_action_delay_seconds", lambda: 3.2)
+    async def paced(**kwargs):
+        events.append(("delay_range", kwargs["delay"]))
+        return await kwargs["action"]()
+    monkeypatch.setattr(plugin.guard, "run", paced)
     monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
 
@@ -1259,7 +1274,7 @@ async def test_catch_up_waits_before_platform_approval(monkeypatch):
     )
 
     assert result.platform_status == "succeeded"
-    assert events == [("sleep", 3.2), ("approve", "paced-catch-up")]
+    assert events == [("delay_range", (15, 45)), ("approve", "paced-catch-up")]
 
 
 @pytest.mark.asyncio
@@ -1488,6 +1503,10 @@ async def test_empty_answer_wait_replaced_by_answer(
         plugin.audit_store = None
     first = empty_request_event()
     await plugin.handle_group_request(first)
+    if not audit_enabled:
+        assert not env.context.llm_calls and not env.approvals and not plugin._empty_answer_tasks
+        await plugin.terminate()
+        return
     await env.entered.wait()
     tasks = list(plugin._empty_answer_tasks)
     assert env.delays == [30]
@@ -1632,7 +1651,7 @@ async def test_reconcile_loop_discovers_active_platform_with_empty_database(monk
         raise asyncio.CancelledError
 
     monkeypatch.setattr(module, "onebot_platform_ids", lambda context: ["napcat-1"])
-    monkeypatch.setattr(plugin, "_reconcile_platform", stop_after_first_platform)
+    monkeypatch.setattr(plugin, "_poll_platform", stop_after_first_platform)
 
     with pytest.raises(asyncio.CancelledError):
         await plugin._reconcile_loop()
@@ -1679,14 +1698,17 @@ async def test_direct_card_update_waits_before_calling_platform(monkeypatch):
     async def fake_set_group_card(*args, **kwargs):
         events.append(("set", kwargs["user_id"]))
 
-    monkeypatch.setattr(module, "_card_action_delay_seconds", lambda: 1.6)
+    async def paced(**kwargs):
+        events.append(("delay_range", kwargs["delay"]))
+        return await kwargs["action"]()
+    monkeypatch.setattr(plugin.guard, "run", paced)
     monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(module, "set_group_card", fake_set_group_card)
 
     result = await plugin._reconcile_application_member(application_id)
 
     assert result == "succeeded"
-    assert events == [("sleep", 1.6), ("set", "20002")]
+    assert events == [("delay_range", (30, 90)), ("set", "20002")]
 
 
 @pytest.mark.asyncio

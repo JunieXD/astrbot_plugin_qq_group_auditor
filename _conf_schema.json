@@ -1,4 +1,16 @@
 {
+  "background_sync_enabled": {
+    "description": "启用后台申请同步",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只处理实时申请和入退群事件，不主动轮询群系统消息或补处理名片。"
+  },
+  "background_sync_interval_seconds": {
+    "description": "后台同步间隔（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "默认 10 分钟，最少 300 秒。掉线或接口失败会逐步延长重试间隔，最长至少 1 小时；实时审核不受此间隔影响。"
+  },
   "group_audits": {
     "description": "QQ群加群审核配置",
     "type": "template_list",
@@ -36,7 +48,7 @@
             "description": "受邀入群时动作",
             "type": "string",
             "default": "ignore",
-            "hint": "填写 approve、ignore 或 reject。受邀请求不调用 LLM；approve 直接通过且不自动改群名片。NapCat 不提供邀请标记，插件仅将原始申请附言完全为空的请求识别为受邀入群。"
+            "hint": "填写 approve、ignore 或 reject。受邀请求不调用 LLM；approve 等待随机审核延迟后通过且不自动改群名片。NapCat 不提供邀请标记，插件仅将原始申请附言完全为空的请求识别为受邀入群。"
           },
           "reject_reason": {
             "description": "固定拒绝理由",
@@ -89,6 +101,88 @@
             "hint": "NapCat 无法读取当前加群问题时使用，并在收到申请时保存快照。"
           }
         }
+      }
+    }
+  },
+  "automation_pacing": {
+    "description": "自动操作节奏与冷却",
+    "type": "object",
+    "hint": "同一 AstrBot 进程中的审核与 GitHub 订阅共享账号排队、间隔与失败暂停；各插件使用自己的配置值。邀请同样遵守审核等待。冷却跨重载保留。",
+    "items": {
+      "review_min_seconds": {
+        "description": "自动审核等待最小秒数",
+        "type": "int",
+        "default": 15
+      },
+      "review_max_seconds": {
+        "description": "自动审核等待最大秒数",
+        "type": "int",
+        "default": 45
+      },
+      "card_min_seconds": {
+        "description": "确认入群后名片等待最小秒数",
+        "type": "int",
+        "default": 30
+      },
+      "card_max_seconds": {
+        "description": "确认入群后名片等待最大秒数",
+        "type": "int",
+        "default": 90
+      },
+      "action_gap_min_seconds": {
+        "description": "账号管理操作间隔最小秒数",
+        "type": "int",
+        "default": 8
+      },
+      "action_gap_max_seconds": {
+        "description": "账号管理操作间隔最大秒数",
+        "type": "int",
+        "default": 15
+      },
+      "notice_min_seconds": {
+        "description": "管理员通知等待及间隔最小秒数",
+        "type": "int",
+        "default": 10
+      },
+      "notice_max_seconds": {
+        "description": "管理员通知等待及间隔最大秒数",
+        "type": "int",
+        "default": 20
+      },
+      "recovery_min_seconds": {
+        "description": "离线恢复等待最小秒数",
+        "type": "int",
+        "default": 60
+      },
+      "recovery_max_seconds": {
+        "description": "离线恢复等待最大秒数",
+        "type": "int",
+        "default": 180
+      },
+      "failure_threshold": {
+        "description": "连续失败后暂停次数",
+        "type": "int",
+        "default": 3
+      },
+      "failure_cooldown_seconds": {
+        "description": "失败暂停秒数",
+        "type": "int",
+        "default": 3600
+      },
+      "notice_dedup_seconds": {
+        "description": "相同管理员通知去重秒数",
+        "type": "int",
+        "default": 600
+      },
+      "lookup_cache_seconds": {
+        "description": "群问题及昵称缓存秒数",
+        "type": "int",
+        "default": 1800
+      },
+      "sync_jitter_seconds": {
+        "description": "后台同步额外随机等待上限秒数",
+        "type": "int",
+        "default": 300
       }
     }
   }

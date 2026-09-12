@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncio
 import time
 
 from .models import (
@@ -394,3 +395,13 @@ async def get_group_system_requests(
         raise PlatformActionError("get_group_system_msg returned invalid data")
     requests = data.get("join_requests") or []
     return [item for item in requests if isinstance(item, dict)]
+
+
+async def is_onebot_online(context: Any, *, platform_id: str) -> bool:
+    """Read NapCat's local status before initiating background QQ requests."""
+    bot = find_onebot_bot(context, platform_id=platform_id)
+    clients = getattr(bot, "_wsr_api_clients", None)
+    if isinstance(clients, dict) and not clients:
+        return False
+    data = await asyncio.wait_for(bot.call_action(action="get_status"), timeout=10)
+    return isinstance(data, dict) and data.get("online") is True

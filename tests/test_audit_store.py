@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from qq_group_auditor.audit_store import AuditStore
 from qq_group_auditor.models import GroupMemberDecrease, GroupMemberIncrease, JoinRequest
 
@@ -17,6 +19,30 @@ def request(flag: str, requested_at: int, answer: str) -> JoinRequest:
         self_id="99999",
         raw_comment=answer,
     )
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "left"])
+def test_card_reconciliation_keeps_deferred_join_but_excludes_completed_or_left(tmp_path, outcome):
+    store = AuditStore(tmp_path / "audit.sqlite3")
+    app_id, _ = store.record_application(
+        platform_id="bot", request=request("deferred", 1000, "answer"),
+        question="q", question_source="config", review_prompt="p",
+    )
+    store.record_action(application_id=app_id, kind="platform", action="approve",
+                        actor_qq="99999", source="plugin", status="succeeded", occurred_at=1001)
+    member_id, _, _ = store.record_join(
+        platform_id="bot", event=GroupMemberIncrease("123", "20001", "99999", "approve", 1002, "99999"),
+        nickname="member", application_id_hint=app_id,
+    )
+    def pending():
+        return store.pending_join_applications(platform_id="bot", group_ids=["123"], now=1100)
+    assert [a["id"] for a in pending()] == [app_id]
+    if outcome == "left":
+        store.record_leave(platform_id="bot", event=GroupMemberDecrease("123", "20001", "20001", "leave", 1050, "99999"))
+    else:
+        store.record_card_operation(membership_id=member_id, template="{nickname}", old_card="", target_card="member", status="skipped")
+    assert pending() == []
+    store.close()
 
 
 def test_answer_enrichment_preserves_reviewed_history(tmp_path):

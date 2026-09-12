@@ -56,4 +56,6 @@ async def send_admin_notice(
 ) -> None:
     for qq_id in admin_qq_ids:
         target = private_umo(platform_name, str(qq_id))
-        await context.send_message(target, MessageChain().message(text))
+        result = await context.send_message(target, MessageChain().message(text))
+        if result is False:
+            raise RuntimeError("管理员通知未发送：平台不可用")

@@ -616,7 +616,10 @@ class AuditStore:
                   a.requested_at
               ) BETWEEN ? AND ?
               AND NOT EXISTS (
-                  SELECT 1 FROM membership_sessions ms WHERE ms.application_id = a.id
+                  SELECT 1 FROM membership_sessions ms
+                  LEFT JOIN card_operations co ON co.membership_id = ms.id
+                  WHERE ms.application_id = a.id
+                    AND (ms.left_at IS NOT NULL OR co.status IN ('succeeded', 'skipped'))
               )
               AND (
                   a.external_checked_at IS NOT NULL

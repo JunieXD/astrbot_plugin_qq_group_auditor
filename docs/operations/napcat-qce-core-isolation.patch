@@ -1,0 +1,27 @@
+--- a/index.mjs
++++ b/index.mjs
+@@ -22,10 +22,11 @@
+ }
+ 
+ export function createFallbackCore(rawCore) {
+-  const safeCore = rawCore && typeof rawCore === 'object' ? rawCore : {};
+-  if (!safeCore.context || typeof safeCore.context !== 'object') {
+-    safeCore.context = {};
+-  }
++  // Keep compatibility overlays private to QCE; NapCat shares rawCore globally.
++  const safeCore = Object.create(rawCore && typeof rawCore === 'object' ? rawCore : null);
++  safeCore.context = Object.create(
++    rawCore?.context && typeof rawCore.context === 'object' ? rawCore.context : null
++  );
+ 
+   const logger = safeCore.context.logger;
+   const existingLogger = logger && (typeof logger === 'object' || typeof logger === 'function')
+@@ -112,6 +113,8 @@
+             if (typeof realMethod === 'function') {
+               return realMethod.bind(realApi);
+             }
++            // Preserve data properties such as groupMemberCache (Map), not a stub.
++            if (realMethod !== undefined) return realMethod;
+             return async () => ({ result: 0, errMsg: '' });
+           }
+         });

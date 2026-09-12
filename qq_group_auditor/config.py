@@ -3,13 +3,30 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from .pacing import normalize_pacing
+
 
 DEFAULT_REJECT_REASON = "加群答案不符合要求，请重新申请并按提示填写。"
 DEFAULT_REVIEW_PROMPT = (
     "请判断申请人的加群答案是否符合本群要求。只有答案明确符合要求时才 approve=true。"
 )
 DEFAULT_CARD_TEMPLATE = "{nickname}"
-DEFAULT_CONFIG = {"group_audits": []}
+DEFAULT_PACING = {
+    "review_min_seconds": 15, "review_max_seconds": 45,
+    "card_min_seconds": 30, "card_max_seconds": 90,
+    "action_gap_min_seconds": 8, "action_gap_max_seconds": 15,
+    "notice_min_seconds": 10, "notice_max_seconds": 20,
+    "recovery_min_seconds": 60, "recovery_max_seconds": 180,
+    "failure_threshold": 3, "failure_cooldown_seconds": 3600,
+    "notice_dedup_seconds": 600, "lookup_cache_seconds": 1800,
+    "sync_jitter_seconds": 300,
+}
+DEFAULT_CONFIG = {
+    "group_audits": [],
+    "background_sync_enabled": True,
+    "background_sync_interval_seconds": 600,
+    "automation_pacing": DEFAULT_PACING,
+}
 VALID_FAILURE_ACTIONS = {"ignore", "reject"}
 VALID_INVITE_ACTIONS = {"approve", "ignore", "reject"}
 TRUE_STRINGS = {"true", "1", "yes", "on"}
@@ -98,6 +115,15 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         if normalized is not None:
             group_audits.append(normalized)
     config["group_audits"] = group_audits
+    config["background_sync_enabled"] = normalize_bool(
+        config.get("background_sync_enabled"), default=True
+    )
+    try:
+        interval = int(config.get("background_sync_interval_seconds", 600))
+    except (TypeError, ValueError, OverflowError):
+        interval = 600
+    config["background_sync_interval_seconds"] = max(300, min(86400, interval))
+    config["automation_pacing"] = normalize_pacing(config.get("automation_pacing"), DEFAULT_PACING)
     return config
 
 

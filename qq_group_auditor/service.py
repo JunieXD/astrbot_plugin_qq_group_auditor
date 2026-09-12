@@ -5,6 +5,7 @@ from typing import Any, Protocol
 
 from .models import ActionResult, JoinRequest, ReviewDecision
 from .reviewer import LLMReviewError
+from .pacing import ActionDeferred
 
 
 class ReviewerPort(Protocol):
@@ -76,6 +77,8 @@ class AuditService:
         if decision.approve:
             try:
                 await self.platform.set_group_request(request, approve=True, reason="")
+            except ActionDeferred as exc:
+                return ActionResult(action="deferred", reason=str(exc))
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "approve", exc)
                 return ActionResult(
@@ -109,6 +112,8 @@ class AuditService:
                     approve=False,
                     reason=reject_reason,
                 )
+            except ActionDeferred as exc:
+                return ActionResult(action="deferred", reason=str(exc))
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "reject", exc)
                 return ActionResult(
@@ -162,6 +167,8 @@ class AuditService:
         if action == "approve":
             try:
                 await self.platform.set_group_request(request, approve=True, reason="")
+            except ActionDeferred as exc:
+                return ActionResult(action="deferred", reason=str(exc))
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "approve", exc)
                 return ActionResult(
@@ -194,6 +201,8 @@ class AuditService:
                     approve=False,
                     reason=str(group_config.get("reject_reason") or ""),
                 )
+            except ActionDeferred as exc:
+                return ActionResult(action="deferred", reason=str(exc))
             except Exception as exc:
                 await self._notify_platform_error(group_config, request, "reject", exc)
                 return ActionResult(
