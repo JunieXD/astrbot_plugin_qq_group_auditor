@@ -58,6 +58,7 @@ class AuditStore:
             raw_comment TEXT NOT NULL DEFAULT '',
             review_prompt TEXT NOT NULL DEFAULT '',
             request_kind TEXT NOT NULL DEFAULT 'application',
+            request_flag TEXT NOT NULL DEFAULT '',
             external_checked_at INTEGER,
             external_actor_qq TEXT NOT NULL DEFAULT ''
         );
@@ -142,7 +143,12 @@ class AuditStore:
                     "ALTER TABLE applications ADD COLUMN "
                     "request_kind TEXT NOT NULL DEFAULT 'application'"
                 )
-            self._connection.execute("PRAGMA user_version = 3")
+            if "request_flag" not in application_columns:
+                self._connection.execute(
+                    "ALTER TABLE applications ADD COLUMN "
+                    "request_flag TEXT NOT NULL DEFAULT ''"
+                )
+            self._connection.execute("PRAGMA user_version = 4")
 
     def close(self) -> None:
         with self._lock:
@@ -180,6 +186,7 @@ class AuditStore:
             request.raw_comment or request.answer,
             review_prompt,
             "invite" if request.request_kind == "invite" else "application",
+            request.flag,
         )
         with self._lock, self._connection:
             cursor = self._connection.execute(
@@ -187,8 +194,8 @@ class AuditStore:
                 INSERT OR IGNORE INTO applications (
                     request_key, platform_id, self_id, group_id, applicant_qq,
                     requested_at, observed_at, nickname, question, question_source,
-                    answer, raw_comment, review_prompt, request_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    answer, raw_comment, review_prompt, request_kind, request_flag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -197,21 +204,43 @@ class AuditStore:
                 # Some adapters enrich an existing flag instead of emitting a new one.
                 self._connection.execute(
                     """
-                    UPDATE applications SET answer = ?, raw_comment = ?
+                    UPDATE applications SET answer = ?, raw_comment = ?, request_kind = ?
                     WHERE request_key = ? AND TRIM(answer) = ''
                       AND NOT EXISTS (
                           SELECT 1 FROM application_actions
-                          WHERE application_id = applications.id AND kind = 'review'
+                          WHERE application_id = applications.id
+                            AND (kind = 'review' OR (kind = 'platform' AND status = 'succeeded'))
                       )
                     """,
-                    (request.answer, request.raw_comment or request.answer, key),
+                    (request.answer, request.raw_comment or request.answer, request.request_kind, key),
                 )
             if request.request_kind == "invite":
                 self._connection.execute(
                     "UPDATE applications SET request_kind = 'invite' "
-                    "WHERE request_key = ?",
+                    "WHERE request_key = ? AND TRIM(answer) = '' "
+                    "AND NOT EXISTS (SELECT 1 FROM application_actions "
+                    "WHERE application_id = applications.id "
+                    "AND (kind = 'review' OR (kind = 'platform' AND status = 'succeeded')))",
                     (key,),
                 )
+            # Backfill flags in pre-v4 databases when the adapter replays them.
+            self._connection.execute(
+                "UPDATE applications SET request_flag = ? WHERE request_key = ?",
+                (request.flag, key),
+            )
+            self._connection.execute(
+                "UPDATE applications SET "
+                "question = CASE WHEN ? != '' AND (question_source != 'platform' OR ? = 'platform') "
+                "THEN ? ELSE question END, "
+                "question_source = CASE WHEN ? != '' AND (question_source != 'platform' OR ? = 'platform') "
+                "THEN ? ELSE question_source END, "
+                "nickname = CASE WHEN ? != '' THEN ? ELSE nickname END "
+                "WHERE request_key = ? AND NOT EXISTS (SELECT 1 FROM application_actions "
+                "WHERE application_id = applications.id "
+                "AND (kind = 'review' OR (kind = 'platform' AND status = 'succeeded')))",
+                (question, question_source, question, question, question_source, question_source,
+                 request.nickname, request.nickname, key),
+            )
             row = self._connection.execute(
                 "SELECT id FROM applications WHERE request_key = ?",
                 (key,),
@@ -1113,6 +1142,80 @@ class AuditStore:
                 (application_id,),
             ).fetchone()
         return row is not None
+
+    def review_blocker(self, application_id: int) -> tuple[str, str] | None:
+        """Use durable observations only; never probe QQ with an approval write."""
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT * FROM applications WHERE id = ?", (application_id,),
+            ).fetchone()
+            if current is None:
+                return "unavailable", "申请记录不存在"
+            if current["external_checked_at"] is not None:
+                return "handled", "等待期间申请已被其他管理员处理"
+            candidates = self._connection.execute(
+                """
+                SELECT id, requested_at, request_flag FROM applications
+                WHERE platform_id = ? AND group_id = ? AND applicant_qq = ?
+                  AND (self_id = ? OR self_id = '' OR ? = '')
+                  AND id != ?
+                ORDER BY requested_at DESC, id DESC
+                """,
+                (current["platform_id"], current["group_id"], current["applicant_qq"],
+                 current["self_id"], current["self_id"], application_id),
+            ).fetchall()
+            for candidate in candidates:
+                old_flag, new_flag = current["request_flag"], candidate["request_flag"]
+                numeric_flags = (old_flag.isascii() and old_flag.isdigit()
+                                 and new_flag.isascii() and new_flag.isdigit())
+                newer = candidate["requested_at"] > current["requested_at"]
+                if numeric_flags and len(old_flag) == len(new_flag) == 16:
+                    # NapCat seq is chronological; OneBot event time can be the
+                    # delivery time of a delayed/replayed older notification.
+                    newer = int(new_flag) > int(old_flag)
+                elif candidate["requested_at"] == current["requested_at"]:
+                    if numeric_flags:
+                        newer = int(new_flag) > int(old_flag)
+                    else:
+                        newer = candidate["id"] > application_id
+                if newer:
+                    return "superseded", f"已收到更新的申请（记录 #{candidate['id']}），旧请求不再审批或通知"
+            joined = self._connection.execute(
+                """
+                SELECT 1 FROM membership_sessions
+                WHERE platform_id = ? AND group_id = ? AND user_id = ?
+                  AND (self_id = ? OR self_id = '' OR ? = '')
+                  AND (application_id = ? OR joined_at >= ?)
+                LIMIT 1
+                """,
+                (current["platform_id"], current["group_id"], current["applicant_qq"],
+                 current["self_id"], current["self_id"], application_id, current["requested_at"]),
+            ).fetchone()
+            if joined:
+                return "handled", "申请后已观察到该成员入群，旧请求不再审批"
+            approved = self._connection.execute(
+                """
+                SELECT 1 FROM application_actions aa
+                JOIN applications a ON a.id = aa.application_id
+                WHERE a.platform_id = ? AND a.group_id = ? AND a.applicant_qq = ?
+                  AND (a.self_id = ? OR a.self_id = '' OR ? = '')
+                  AND a.id != ? AND aa.kind = 'platform' AND aa.action = 'approve'
+                  AND aa.status = 'succeeded' AND aa.occurred_at >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM membership_sessions ms
+                      WHERE ms.platform_id = a.platform_id AND ms.group_id = a.group_id
+                        AND ms.user_id = a.applicant_qq
+                        AND ms.left_at >= aa.occurred_at AND ms.left_at <= ?
+                  )
+                LIMIT 1
+                """,
+                (current["platform_id"], current["group_id"], current["applicant_qq"],
+                 current["self_id"], current["self_id"], application_id,
+                 current["requested_at"], current["requested_at"]),
+            ).fetchone()
+            if approved:
+                return "handled", "等待期间该成员的其他申请已通过，旧请求不再审批"
+        return None
 
     def platform_ids(self) -> list[str]:
         with self._lock:

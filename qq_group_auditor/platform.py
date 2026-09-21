@@ -19,6 +19,28 @@ class PlatformActionError(Exception):
     pass
 
 
+class RequestUnavailableError(PlatformActionError):
+    """NapCat explicitly could not find the request; no approval was submitted."""
+
+
+def _request_is_unavailable(exc: Exception) -> bool:
+    # aiocqhttp exposes the OneBot error response through .result; other
+    # adapters use .info. Do not classify
+    # retcode=1200 alone: permission and transport errors use it as well.
+    info = getattr(exc, "result", None)
+    if not isinstance(info, dict):
+        info = getattr(exc, "info", None)
+    if isinstance(info, dict):
+        messages = [info.get("wording"), info.get("message")]
+    else:
+        messages = [str(exc)]
+    for message in messages:
+        first_line = str(message or "").strip().split("\n", 1)[0]
+        if first_line in {"No such request", "Error: No such request", "NapCat Error: No such request"}:
+            return True
+    return False
+
+
 def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
     if isinstance(raw, dict):
         return raw.get(key, default)
@@ -251,6 +273,8 @@ async def set_group_request(
             reason=reason,
         )
     except Exception as exc:
+        if _request_is_unavailable(exc):
+            raise RequestUnavailableError("NapCat 已找不到该申请，可能已合并、撤回或被处理") from exc
         raise PlatformActionError(f"set_group_add_request failed: {exc}") from exc
 
 

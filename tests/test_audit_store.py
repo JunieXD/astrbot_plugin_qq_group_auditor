@@ -76,6 +76,35 @@ def test_answer_enrichment_preserves_reviewed_history(tmp_path):
     store.close()
 
 
+def test_v3_upgrade_keeps_actions_and_backfills_flags_without_rewriting_reviewed_content(tmp_path):
+    database = tmp_path / "audit.sqlite3"
+    store = AuditStore(database)
+    app_id, _ = store.record_application(
+        platform_id="bot", request=request("old", 1000, ""),
+        question="原问题", question_source="platform", review_prompt="原规则",
+    )
+    store.record_action(application_id=app_id, kind="platform", action="approve",
+                        actor_qq="99999", source="plugin", status="succeeded")
+    store.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE applications DROP COLUMN request_flag")
+        connection.execute("PRAGMA user_version = 3")
+    store = AuditStore(database)
+    replay_id, created = store.record_application(
+        platform_id="bot", request=request("old", 1000, "晚到的答案"),
+        question="新问题", question_source="config", review_prompt="新规则",
+    )
+    detail = store.detail(group_id="123", application_id=app_id)
+    assert (replay_id, created) == (app_id, False)
+    assert detail["request_flag"] == "old"
+    assert detail["answer"] == ""
+    assert detail["question"] == "原问题"
+    assert detail["review_prompt"] == "原规则"
+    assert len(detail["actions"]) == 1
+    assert detail["actions"][0]["status"] == "succeeded"
+    store.close()
+
+
 def test_repeated_applications_and_memberships_are_kept_as_separate_history(tmp_path):
     store = AuditStore(tmp_path / "audit.sqlite3")
     first_id, first_created = store.record_application(
@@ -244,7 +273,7 @@ def test_existing_database_migrates_request_kind_without_losing_rows(tmp_path):
     connection.close()
 
     assert request_kind == "application"
-    assert user_version == 3
+    assert user_version == 4
 
 
 def test_external_checked_without_join_is_inferred_as_reject(tmp_path):

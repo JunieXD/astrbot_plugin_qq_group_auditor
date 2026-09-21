@@ -4,6 +4,7 @@ import pytest
 
 from qq_group_auditor.platform import (
     PlatformActionError,
+    RequestUnavailableError,
     extract_group_member_decrease,
     extract_group_member_increase,
     extract_join_request,
@@ -83,6 +84,33 @@ class FakeContext:
             )()
         else:
             self.platform_manager = type("PM", (), {"platform_insts": platform_insts})()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_attribute", ["result", "info"])
+@pytest.mark.parametrize("message,unavailable", [
+    ("NapCat Error: No such request\n    at handler", True),
+    ("Error: No such request", True),
+    ("No such request", True),
+    ("permission denied", False),
+    ("request timeout", False),
+    ("No such request permission", False),
+])
+async def test_approval_error_classifies_only_explicit_missing_request(message, unavailable, response_attribute):
+    class ActionFailed(Exception):
+        def __init__(self):
+            setattr(self, response_attribute, {"retcode": 1200, "wording": message})
+
+        def __str__(self):
+            return "<ActionFailed, retcode=1200>"
+
+    class Bot(FakeBot):
+        async def call_action(self, **kwargs):
+            raise ActionFailed()
+
+    with pytest.raises(PlatformActionError) as error:
+        await set_group_request(FakeContext(Bot()), flag="old", sub_type="add", approve=True, reason="")
+    assert isinstance(error.value, RequestUnavailableError) is unavailable
 
 
 def test_extract_join_request_from_onebot_add_request():

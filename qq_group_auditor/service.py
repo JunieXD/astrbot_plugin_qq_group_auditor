@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .models import ActionResult, JoinRequest, ReviewDecision
 from .reviewer import LLMReviewError
@@ -44,16 +44,27 @@ class AuditService:
         platform: PlatformPort,
         notifier: NotifierPort,
         logger: LoggerPort | None = None,
+        check_request: Callable[[], None] | None = None,
     ) -> None:
         self.reviewer = reviewer
         self.platform = platform
         self.notifier = notifier
         self.logger = logger or logging.getLogger(__name__)
+        self.check_request = check_request or (lambda: None)
 
     async def handle_request(
         self,
         group_config: dict[str, Any],
         request: JoinRequest,
+    ) -> ActionResult:
+        try:
+            self.check_request()
+            return await self._handle_request(group_config, request)
+        except ActionDeferred as exc:
+            return ActionResult(action="deferred", reason=str(exc))
+
+    async def _handle_request(
+        self, group_config: dict[str, Any], request: JoinRequest,
     ) -> ActionResult:
         if request.request_kind == "invite":
             return await self._handle_invited_request(group_config, request)
@@ -61,6 +72,7 @@ class AuditService:
         try:
             decision = await self._decision_for_request(group_config, request)
         except LLMReviewError as exc:
+            self.check_request()
             await self._notify_safely(
                 group_config=group_config,
                 request=request,
@@ -74,6 +86,7 @@ class AuditService:
                 review_action="error",
             )
 
+        self.check_request()
         if decision.approve:
             try:
                 await self.platform.set_group_request(request, approve=True, reason="")
@@ -285,5 +298,7 @@ class AuditService:
                 reason=reason,
                 error=error,
             )
+        except ActionDeferred:
+            raise
         except Exception:
             self.logger.warning("failed to send audit notification", exc_info=True)

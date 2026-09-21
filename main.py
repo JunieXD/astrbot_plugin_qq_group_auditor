@@ -34,6 +34,7 @@ try:
     from .qq_group_auditor.platform import (
         get_group_member_info,
         PlatformActionError,
+        RequestUnavailableError,
         extract_group_member_decrease,
         extract_group_member_increase,
         extract_join_request,
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
     from qq_group_auditor.platform import (
         get_group_member_info,
         PlatformActionError,
+        RequestUnavailableError,
         extract_group_member_decrease,
         extract_group_member_increase,
         extract_join_request,
@@ -229,10 +231,11 @@ class RuntimePlatform:
 
 
 class RuntimeNotifier:
-    def __init__(self, context: Context, platform_id: str | None = None, sender=None) -> None:
+    def __init__(self, context: Context, platform_id: str | None = None, sender=None, check_request=None) -> None:
         self.context = context
         self.platform_id = platform_id
         self.sender = sender
+        self.check_request = check_request
 
     async def notify(
         self,
@@ -247,7 +250,10 @@ class RuntimeNotifier:
         text = format_notice(title, request, action, reason=reason, error=error)
         try:
             if self.sender is not None:
-                await self.sender(group_config, text, self.platform_id)
+                options = {}
+                if self.check_request is not None and action in {"ignore", "error"}:
+                    options["check_request"] = self.check_request
+                await self.sender(group_config, text, self.platform_id, **options)
                 return
             await send_admin_notice(
                 self.context,
@@ -255,6 +261,8 @@ class RuntimeNotifier:
                 text,
                 platform_name=self.platform_id or "aiocqhttp",
             )
+        except ActionDeferred:
+            raise
         except Exception:
             logger.warning("failed to send audit notification", exc_info=True)
 
@@ -336,7 +344,8 @@ def _audit_database_path() -> str | Path:
 
 def _tracks_requests(group_config: dict[str, Any]) -> bool:
     return bool(
-        group_config.get("audit_log_enabled", True)
+        group_config.get("enabled", False)
+        or group_config.get("audit_log_enabled", True)
         or group_config.get("auto_set_card", False)
     )
 
@@ -347,7 +356,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.7")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.8")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -431,17 +440,26 @@ class QQGroupAuditorPlugin(Star):
         finally:
             self._action_tasks.discard(task)
 
-    async def _send_notice(self, group_config, text, platform_id):
+    async def _send_notice(self, group_config, text, platform_id, *, check_request=None):
         pacing = self.config["automation_pacing"]
         for qq_id in dict.fromkeys(group_config.get("admin_qq_ids") or []):
+            async def send():
+                if check_request is not None:
+                    try:
+                        check_request()
+                    except ActionDeferred as exc:
+                        raise self.guard.deferred_error(str(exc)) from exc
+                await send_admin_notice(self.context, [qq_id], text, platform_name=platform_id or "aiocqhttp")
             try:
                 await self._run_guarded(
                     platform_id,
-                    lambda: send_admin_notice(self.context, [qq_id], text, platform_name=platform_id or "aiocqhttp"),
+                    send,
                     delay=delay_range(pacing, "notice"), gap=delay_range(pacing, "notice"),
                     key=f"notice:{qq_id}:{text}", dedup_seconds=pacing["notice_dedup_seconds"],
                 )
             except ActionDeferred:
+                if check_request is not None:
+                    check_request()
                 logger.info("审核通知已跳过：QQ 离线或账号冷却中")
 
     async def _cached_lookup(self, key, action):
@@ -453,17 +471,59 @@ class QQGroupAuditorPlugin(Star):
             self._lookup_cache[key] = (time.monotonic() + self.config["automation_pacing"]["lookup_cache_seconds"], value)
             return value
 
-    async def _execute_review_action(self, request, application_id, platform_id, **kwargs):
+    def _finish_obsolete_request(self, request, application_id, action, reason):
+        assert self.audit_store is not None
+        if application_id is not None and not self.audit_store.has_review_action(application_id):
+            self.audit_store.record_action(
+                application_id=application_id, kind="review", action=action,
+                actor_qq=request.self_id, source="request_lifecycle", status="completed", reason=reason,
+            )
+            logger.info("群审核请求已结束：记录 #%s，%s", application_id, reason)
+
+    def _check_review_request(self, request, application_id):
+        if self._stopped:
+            raise ActionDeferred("插件正在重载")
         if find_group_config(self.config, request.group_id) is None:
-            raise self.guard.deferred_error("该群自动审核已关闭")
+            raise ActionDeferred("该群自动审核已关闭")
         if self.audit_store is None:
-            raise self.guard.deferred_error("审计数据库不可用")
-        if application_id is not None:
-            detail = self.audit_store.detail(group_id=request.group_id, application_id=application_id)
-            if detail and (detail.get("external_checked_at") or detail.get("memberships")):
-                raise self.guard.deferred_error("等待期间申请已被处理或成员已入群")
-        await set_group_request(self.context, flag=request.flag, sub_type=request.sub_type,
-                                platform_id=platform_id, **kwargs)
+            raise ActionDeferred("审计数据库不可用")
+        if application_id is None:
+            raise ActionDeferred("申请尚未持久化，暂停审核")
+        if self.audit_store.has_review_action(application_id):
+            raise ActionDeferred("该申请已有处理记录")
+        detail = self.audit_store.detail(group_id=request.group_id, application_id=application_id)
+        if detail and any(a["kind"] == "platform" and a["status"] == "succeeded"
+                          and a["action"] in {"approve", "reject"} for a in detail["actions"]):
+            raise ActionDeferred("该申请已完成平台审批")
+        blocker = self.audit_store.review_blocker(application_id)
+        if blocker:
+            self._finish_obsolete_request(request, application_id, *blocker)
+            raise ActionDeferred(blocker[1])
+        if detail and (detail["answer"] != request.answer or detail["request_kind"] != request.request_kind):
+            # A same-flag enrichment is reviewed by its waiting handler, not by
+            # the older empty-answer/invitation decision. It is not terminal.
+            raise ActionDeferred("申请内容已更新，等待使用新内容审核")
+
+    async def _execute_review_action(self, request, application_id, platform_id, *, source="plugin", **kwargs):
+        try:
+            self._check_review_request(request, application_id)
+        except ActionDeferred as exc:
+            # The guard may be shared with another plugin module instance.
+            raise self.guard.deferred_error(str(exc)) from exc
+        try:
+            await set_group_request(self.context, flag=request.flag, sub_type=request.sub_type,
+                                    platform_id=platform_id, **kwargs)
+        except RequestUnavailableError as exc:
+            self._finish_obsolete_request(request, application_id, "unavailable", str(exc))
+            raise self.guard.deferred_error(str(exc)) from exc
+        # Save the confirmed platform outcome before a potentially slow notice.
+        # Another flag may already be queued, or a reload may interrupt notices.
+        assert self.audit_store is not None
+        self.audit_store.record_action(
+            application_id=application_id, kind="platform",
+            action="approve" if kwargs["approve"] else "reject", actor_qq=request.self_id,
+            source=source, status="succeeded", reason="平台审批接口已确认成功",
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
@@ -537,6 +597,10 @@ class QQGroupAuditorPlugin(Star):
             unified_msg_origin=unified_msg_origin,
             action_source=action_source,
         )
+        try:
+            self._check_review_request(request, application_id)
+        except ActionDeferred:
+            return None
         if request.request_kind == "invite":
             return await self._review_application_now(**kwargs)
         if (
@@ -677,13 +741,17 @@ class QQGroupAuditorPlugin(Star):
                 action_delay_seconds=action_delay_seconds,
                 executor=lambda req, **kw: self._run_guarded(
                     platform_id,
-                    lambda: self._execute_review_action(req, application_id, platform_id, **kw),
+                    lambda: self._execute_review_action(req, application_id, platform_id, source=action_source, **kw),
                     delay=delay_range(self.config["automation_pacing"], "review"),
                     key=f"review:{req.group_id}:{req.applicant_qq}:{req.flag}",
                 ),
             ),
-            RuntimeNotifier(self.context, platform_id=platform_id, sender=self._send_notice),
+            RuntimeNotifier(
+                self.context, platform_id=platform_id, sender=self._send_notice,
+                check_request=lambda: self._check_review_request(request, application_id),
+            ),
             logger=logger,
+            check_request=lambda: self._check_review_request(request, application_id),
         )
         result = await service.handle_request(group_config, request)
         if application_id is None:
@@ -717,6 +785,14 @@ class QQGroupAuditorPlugin(Star):
     ) -> tuple[JoinRequest, int, bool]:
         question = str(group_config.get("application_question") or "").strip()
         question_source = "config" if question else "unknown"
+        # Register new flags before network lookups so queued older actions see
+        # them even while question/nickname enrichment is slow.
+        assert self.audit_store is not None
+        self.audit_store.record_application(
+            platform_id=platform_id or "aiocqhttp", request=request,
+            question=question, question_source=question_source,
+            review_prompt=str(group_config.get("review_prompt") or ""),
+        )
         try:
             platform_question = await self._cached_lookup(
                 ("question", platform_id, request.group_id),
@@ -761,6 +837,10 @@ class QQGroupAuditorPlugin(Star):
             question_source=question_source,
             review_prompt=str(group_config.get("review_prompt") or ""),
         )
+        detail = self.audit_store.detail(group_id=request.group_id, application_id=application_id)
+        if detail:
+            request = replace(request, answer=detail["answer"], raw_comment=detail["raw_comment"],
+                              request_kind=detail["request_kind"], requested_at=detail["requested_at"])
         return request, application_id, self.audit_store.has_review_action(application_id)
 
     def _record_service_result(
@@ -1511,8 +1591,21 @@ class QQGroupAuditorPlugin(Star):
             platform_id=platform_id,
             count=100,
         )
-        catch_up_reviews = 0
+        # Persist the entire snapshot before approving anything. Otherwise an
+        # oldest-first adapter response lets an obsolete flag be acted on before
+        # its replacement (or externally checked status) is even observed.
+        persisted_requests = []
         for item in requests:
+            try:
+                await self._reconcile_system_request(
+                    item=item, platform_id=platform_id, now=now, allow_catch_up=False,
+                )
+            except Exception:
+                logger.exception("failed to persist one group system request")
+            else:
+                persisted_requests.append(item)
+        catch_up_reviews = 0
+        for item in persisted_requests:
             try:
                 attempted = await self._reconcile_system_request(
                     item=item,
@@ -1554,6 +1647,14 @@ class QQGroupAuditorPlugin(Star):
         if not _tracks_requests(group_config):
             return False
         raw_comment = str(item.get("message") or item.get("comment") or "").strip()
+        # NapCat omits request_time in get_group_system_msg. Its 16-digit seq
+        # contains epoch microseconds; using sync time would make old requests
+        # appear newer than live requests. Other adapters retain the fallback.
+        fallback_time = now
+        if flag.isascii() and flag.isdigit() and len(flag) == 16:
+            sequence_time = int(flag) // 1_000_000
+            if 946684800 <= sequence_time <= now + 60:
+                fallback_time = sequence_time
         request = JoinRequest(
             group_id=group_id,
             applicant_qq=applicant_qq,
@@ -1562,7 +1663,7 @@ class QQGroupAuditorPlugin(Star):
             sub_type="add",
             requested_at=_timestamp(
                 item.get("request_time") or item.get("time"),
-                now,
+                fallback_time,
             ),
             nickname=str(item.get("requester_nick") or "").strip(),
             raw_comment=raw_comment,
@@ -1587,6 +1688,10 @@ class QQGroupAuditorPlugin(Star):
             return False
         if self.audit_store.application_is_invite(application_id):
             request = replace(request, request_kind="invite")
+        detail = self.audit_store.detail(group_id=group_id, application_id=application_id)
+        if detail:
+            request = replace(request, answer=detail["answer"], raw_comment=detail["raw_comment"],
+                              requested_at=detail["requested_at"])
         enabled_group = find_group_config(self.config, group_id)
         if (
             not allow_catch_up

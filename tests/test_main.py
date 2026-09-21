@@ -252,7 +252,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.7"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.8"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -1376,7 +1376,9 @@ async def test_reconcile_isolates_unexpected_system_request_failure(monkeypatch)
 
     await plugin._reconcile_platform("napcat-1")
 
-    assert visited == [111, 222]
+    # The broken row is isolated in the persistence pass; only the good row
+    # reaches the catch-up pass.
+    assert visited == [111, 222, 222]
 
 
 @pytest.mark.asyncio
