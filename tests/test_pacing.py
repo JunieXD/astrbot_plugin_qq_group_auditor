@@ -147,3 +147,230 @@ def test_invalid_ranges_are_normalized():
     assert pacing.normalize_pacing({"review_min_seconds": 80, "review_max_seconds": -3,
                                     "failure_threshold": float("nan")}, defaults) == {
         "review_min_seconds": 80, "review_max_seconds": 80, "failure_threshold": 3}
+
+
+class ManualClock:
+    def __init__(self):
+        self.now = 1000.0
+        self.waiters = []
+        self.real_sleep = asyncio.sleep
+
+    async def sleep(self, seconds):
+        if seconds <= 0:
+            await self.real_sleep(0)
+            return
+        future = asyncio.get_running_loop().create_future()
+        self.waiters.append((self.now + seconds, future))
+        await future
+
+    async def settle(self):
+        for _ in range(12):
+            await self.real_sleep(0)
+
+    async def advance(self, seconds):
+        self.now += seconds
+        for deadline, future in self.waiters:
+            if deadline <= self.now and not future.done():
+                future.set_result(None)
+        self.waiters = [(d, f) for d, f in self.waiters if not f.done()]
+        await self.settle()
+
+
+@pytest.fixture
+def manual_runtime(monkeypatch, tmp_path):
+    clock = ManualClock()
+    monkeypatch.setattr(pacing.time, "time", lambda: clock.now)
+    monkeypatch.setattr(pacing.asyncio, "sleep", clock.sleep)
+    monkeypatch.setattr(pacing.random, "uniform", lambda lo, hi: lo)
+    return pacing.ActionGuard(tmp_path / "state.json"), clock
+
+
+@pytest.mark.asyncio
+async def test_ready_approval_overtakes_earlier_card_wait(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def record(name):
+        calls.append((name, clock.now))
+
+    card = asyncio.create_task(guard.run(account="bot", online=online,
+        action=lambda: record("card"), config=CONFIG, delay=(90, 90), gap=(10, 10)))
+    await clock.settle()
+    approval = asyncio.create_task(guard.run(account="bot", online=online,
+        action=lambda: record("approval"), config=CONFIG, delay=(5, 5), gap=(10, 10)))
+    await clock.settle()
+    await clock.advance(5)
+    assert calls == [("approval", 1005)]
+    assert not card.done()
+    await clock.advance(85)
+    await asyncio.gather(card, approval)
+    assert calls == [("approval", 1005), ("card", 1090)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_long_wait_does_not_reserve_account(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def action():
+        calls.append(clock.now)
+
+    task = asyncio.create_task(guard.run(account="bot", online=online, action=action,
+        config=CONFIG, delay=(90, 90), key="card"))
+    await clock.settle()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    restored = pacing.ActionGuard(guard.path)
+    assert restored.accounts["bot"].get("next_at", 0) <= clock.now
+    assert restored.accounts["bot"]["operations"] == {}
+    approval = asyncio.create_task(restored.run(account="bot", online=online, action=action,
+        config=CONFIG, delay=(5, 5), key="approval"))
+    await clock.settle()
+    await clock.advance(5)
+    await approval
+    assert calls == [1005]
+
+
+@pytest.mark.asyncio
+async def test_shared_gap_is_measured_after_slow_action_completes(manual_runtime):
+    guard, clock = manual_runtime
+    release = asyncio.Event()
+    calls = []
+
+    async def slow():
+        calls.append(("slow", clock.now))
+        await release.wait()
+
+    async def next_action():
+        calls.append(("next", clock.now))
+
+    first = asyncio.create_task(guard.run(account="bot", online=online, action=slow,
+        config=CONFIG, gap=(10, 10)))
+    await clock.settle()
+    second = asyncio.create_task(guard.run(account="bot", online=online, action=next_action,
+        config=CONFIG, gap=(10, 10)))
+    await clock.advance(7)
+    release.set()
+    await clock.settle()
+    await clock.advance(9)
+    assert calls == [("slow", 1000)]
+    await clock.advance(1)
+    await asyncio.gather(first, second)
+    assert calls == [("slow", 1000), ("next", 1017)]
+
+
+@pytest.mark.asyncio
+async def test_recovery_wait_is_shared_by_later_tasks(manual_runtime):
+    guard, clock = manual_runtime
+    guard.accounts["bot"] = {"was_offline": True, "paused_until": 1000}
+    calls = []
+
+    async def action():
+        calls.append(clock.now)
+
+    first = asyncio.create_task(guard.run(account="bot", online=online, action=action,
+        config=CONFIG, gap=(10, 10)))
+    await clock.settle()
+    second = asyncio.create_task(guard.run(account="bot", online=online, action=action,
+        config=CONFIG, gap=(10, 10)))
+    await clock.settle()
+    assert pacing.ActionGuard(guard.path).accounts["bot"]["recovery_until"] == 1060
+    await clock.advance(59)
+    assert calls == []
+    await clock.advance(1)
+    assert calls == [1060]
+    await clock.advance(10)
+    await asyncio.gather(first, second)
+    assert calls == [1060, 1070]
+
+
+@pytest.mark.asyncio
+async def test_failure_cooldown_stops_actions_already_sleeping(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def failure():
+        raise TimeoutError()
+
+    async def action():
+        calls.append(clock.now)
+
+    config = {**CONFIG, "failure_threshold": 1}
+    pending = asyncio.create_task(guard.run(account="bot", online=online, action=action,
+        config=config, delay=(20, 20)))
+    failing = asyncio.create_task(guard.run(account="bot", online=online, action=failure,
+        config=config, delay=(5, 5)))
+    await clock.settle()
+    await clock.advance(5)
+    await clock.advance(15)
+    outcomes = await asyncio.gather(failing, pending, return_exceptions=True)
+    assert isinstance(outcomes[0], TimeoutError)
+    assert isinstance(outcomes[1], pacing.ActionDeferred)
+    assert not calls
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_keys_do_not_send_twice(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def action():
+        calls.append(clock.now)
+
+    tasks = [asyncio.create_task(guard.run(account="bot", online=online, action=action,
+        config=CONFIG, delay=(5, 5), key="same-request")) for _ in range(3)]
+    await clock.settle()
+    await clock.advance(5)
+    await asyncio.gather(*tasks)
+    assert calls == [1005]
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_exception(manual_runtime):
+    guard, clock = manual_runtime
+    spec = importlib.util.spec_from_file_location("older_plugin_pacing", pacing.__file__)
+    older = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(older)
+    old_error = older.ActionDeferred
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class LegacyGuard(older.ActionGuard):
+        scheduling_version = 1
+
+        async def run_old_call(self):
+            async with self.locks.setdefault("bot", asyncio.Lock()):
+                entered.set()
+                await release.wait()
+                # An in-flight v1 call catches its original module's exception.
+                try:
+                    raise self.deferred_error("obsolete request")
+                except old_error:
+                    return "deferred"
+
+    legacy = LegacyGuard(guard.path)
+    manager = SimpleNamespace(_qq_automation_guard_v1=legacy)
+    running = asyncio.create_task(legacy.run_old_call())
+    await entered.wait()
+    locks, accounts = legacy.locks, legacy.accounts
+    upgraded = pacing.get_guard(SimpleNamespace(platform_manager=manager), guard.path.parent)
+    assert upgraded is legacy
+    assert upgraded.locks is locks and upgraded.accounts is accounts
+    assert upgraded.deferred_error is old_error
+    assert upgraded.scheduling_version == 2
+    calls = []
+
+    async def action():
+        calls.append(clock.now)
+        raise old_error("already handled")
+
+    pending = asyncio.create_task(upgraded.run(account="bot", online=online, action=action,
+        config=CONFIG, key="new-call"))
+    await clock.settle()
+    assert calls == []
+    release.set()
+    await clock.settle()
+    assert await running == "deferred"
+    with pytest.raises(old_error):
+        await pending
+    assert upgraded.accounts["bot"].get("failures", 0) == 0
+    assert upgraded.accounts["bot"]["operations"] == {}

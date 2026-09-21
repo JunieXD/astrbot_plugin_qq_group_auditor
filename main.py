@@ -356,7 +356,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.8")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.9")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -371,7 +371,6 @@ class QQGroupAuditorPlugin(Star):
         self._pending_empty_reviews: dict[tuple[str, str, str], _PendingEmptyReview] = {}
         self._empty_answer_tasks: set[asyncio.Task[None]] = set()
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
-        self._card_attempt_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
         self._action_tasks: set[asyncio.Task] = set()
         self._stopped = False
@@ -952,76 +951,116 @@ class QQGroupAuditorPlugin(Star):
         notify_error: bool = True,
         preapplied_card: str = "",
     ) -> str:
+        recorded_join = self._record_member_increase(
+            increase=increase, platform_id=platform_id, member_info=member_info,
+            application_id_hint=application_id_hint, action_source=action_source,
+        )
         normalized_platform_id = platform_id or "aiocqhttp"
         lock_key = (normalized_platform_id, increase.group_id, increase.user_id)
         lock = self._member_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
-            membership_id: int | None = None
-            application_id: int | None = application_id_hint
-            created = True
-            if self.audit_store is not None:
-                try:
-                    membership_id, application_id, created = self.audit_store.record_join(
-                        platform_id=normalized_platform_id,
-                        event=increase,
-                        nickname=member_info.nickname,
-                        old_card=member_info.card,
-                        application_id_hint=application_id_hint,
-                        correlation_hint=action_source,
-                    )
-                    if application_id is not None:
-                        confirmation_reason = (
-                            "通过群名片设置接口确认已入群"
-                            if action_source.endswith("_direct")
-                            else ""
-                        )
-                        self.audit_store.record_action(
-                            application_id=application_id,
-                            kind="platform",
-                            action=(
-                                "approve" if increase.sub_type == "approve" else "invite"
-                            ),
-                            actor_qq=increase.operator_id,
-                            source=action_source,
-                            status="observed",
-                            reason=confirmation_reason,
-                            occurred_at=increase.occurred_at,
-                        )
-                except Exception:
-                    logger.exception("failed to persist group increase event")
+            return await self._process_member_increase_locked(
+                group_config=group_config, increase=increase, platform_id=platform_id,
+                member_info=member_info, member_error=member_error,
+                application_id_hint=application_id_hint, action_source=action_source,
+                force_card=force_card, notify_error=notify_error, preapplied_card=preapplied_card,
+                recorded_join=recorded_join,
+            )
 
-            auto_card_enabled = bool(
-                group_config.get("enabled", True)
-                and group_config.get("auto_set_card", False)
-            )
-            invited_membership = increase.sub_type == "invite" or (
-                self.audit_store is not None
-                and application_id is not None
-                and self.audit_store.application_is_invite(application_id)
-            )
-            if invited_membership:
-                return "invited"
-            if not auto_card_enabled:
-                return "disabled"
-            if not created and not force_card:
-                return "already_seen"
-            if (
-                self.audit_store is not None
-                and membership_id is not None
-                and self.audit_store.has_successful_card_operation(membership_id)
-            ):
-                return "already_done"
-            return await self._apply_member_card(
-                group_config=group_config,
-                increase=increase,
-                platform_id=platform_id,
-                member_info=member_info,
-                member_error=member_error,
-                membership_id=membership_id,
-                application_id=application_id,
-                notify_error=notify_error,
-                preapplied_card=preapplied_card,
-            )
+    def _record_member_increase(
+        self, *, increase, platform_id, member_info, application_id_hint, action_source,
+    ) -> tuple[int | None, int | None, bool]:
+        """Persist membership observations before any card queue can delay them."""
+        normalized_platform_id = platform_id or "aiocqhttp"
+        membership_id: int | None = None
+        application_id: int | None = application_id_hint
+        created = True
+        if self.audit_store is not None:
+            try:
+                membership_id, application_id, created = self.audit_store.record_join(
+                    platform_id=normalized_platform_id,
+                    event=increase,
+                    nickname=member_info.nickname,
+                    old_card=member_info.card,
+                    application_id_hint=application_id_hint,
+                    correlation_hint=action_source,
+                )
+                if application_id is not None:
+                    confirmation_reason = (
+                        "通过群名片设置接口确认已入群"
+                        if action_source.endswith("_direct")
+                        else ""
+                    )
+                    self.audit_store.record_action(
+                        application_id=application_id,
+                        kind="platform",
+                        action=(
+                            "approve" if increase.sub_type == "approve" else "invite"
+                        ),
+                        actor_qq=increase.operator_id,
+                        source=action_source,
+                        status="observed",
+                        reason=confirmation_reason,
+                        occurred_at=increase.occurred_at,
+                    )
+            except Exception:
+                logger.exception("failed to persist group increase event")
+
+        return membership_id, application_id, created
+
+    async def _process_member_increase_locked(
+        self,
+        *,
+        group_config: dict[str, Any],
+        increase: GroupMemberIncrease,
+        platform_id: str | None,
+        member_info: GroupMemberInfo,
+        member_error: str = "",
+        application_id_hint: int | None = None,
+        action_source: str,
+        force_card: bool = False,
+        notify_error: bool = True,
+        preapplied_card: str = "",
+        recorded_join: tuple[int | None, int | None, bool] | None = None,
+    ) -> str:
+        """Record the join/card outcome while holding this member's shared lock."""
+        membership_id, application_id, created = recorded_join or self._record_member_increase(
+            increase=increase, platform_id=platform_id, member_info=member_info,
+            application_id_hint=application_id_hint, action_source=action_source,
+        )
+
+        auto_card_enabled = bool(
+            group_config.get("enabled", True)
+            and group_config.get("auto_set_card", False)
+        )
+        invited_membership = increase.sub_type == "invite" or (
+            self.audit_store is not None
+            and application_id is not None
+            and self.audit_store.application_is_invite(application_id)
+        )
+        if invited_membership:
+            return "invited"
+        if not auto_card_enabled:
+            return "disabled"
+        if not created and not force_card:
+            return "already_seen"
+        if (
+            self.audit_store is not None
+            and membership_id is not None
+            and self.audit_store.has_successful_card_operation(membership_id)
+        ):
+            return "already_done"
+        return await self._apply_member_card(
+            group_config=group_config,
+            increase=increase,
+            platform_id=platform_id,
+            member_info=member_info,
+            member_error=member_error,
+            membership_id=membership_id,
+            application_id=application_id,
+            notify_error=notify_error,
+            preapplied_card=preapplied_card,
+        )
 
     def _handle_member_decrease(self, event: Any, decrease: Any) -> None:
         group_config = find_group_policy(self.config, decrease.group_id)
@@ -1181,8 +1220,16 @@ class QQGroupAuditorPlugin(Star):
         user_id = str(application.get("applicant_qq") or "")
         platform_id = str(application.get("platform_id") or "aiocqhttp")
         lock_key = (platform_id, group_id, user_id)
-        lock = self._card_attempt_locks.setdefault(lock_key, asyncio.Lock())
+        lock = self._member_locks.setdefault(lock_key, asyncio.Lock())
         async with lock:
+            # A live join handler may have completed while this reconciliation
+            # waited. Re-read its membership/card outcome before queuing a write.
+            if self.audit_store is None:
+                return "deferred"
+            current = self.audit_store.application_for_reconciliation(int(application["id"]))
+            if current is None:
+                return "skipped"
+            application = {**application, **current}
             return await self._set_card_from_application_locked(
                 group_config=group_config,
                 application=application,
@@ -1365,7 +1412,7 @@ class QQGroupAuditorPlugin(Star):
             status="succeeded",
         )
 
-        return await self._process_member_increase(
+        return await self._process_member_increase_locked(
             group_config=group_config,
             increase=increase,
             platform_id=platform_id,
