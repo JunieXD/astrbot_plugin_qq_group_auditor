@@ -252,7 +252,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.10"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.11"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -778,7 +778,7 @@ async def test_reconcile_treats_external_handled_without_join_as_reject(monkeypa
             {
                 "request_id": 12345,
                 "group_id": 123,
-                "invitor_uin": 20002,
+                "requester_uin": "20002",
                 "message": "关键词答案",
                 "requester_nick": "申请人",
                 "checked": True,
@@ -1230,6 +1230,103 @@ async def test_reconcile_catches_up_pending_request_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("second_checked", [False, True])
+async def test_reload_recovers_napcat_requests_interrupted_before_approval(
+    monkeypatch, tmp_path, second_checked,
+):
+    from test_platform import FakeBot, FakePlatform
+
+    module, _ = import_main(monkeypatch)
+    monkeypatch.setattr(module, "_audit_database_path", lambda: tmp_path / "audit.sqlite3")
+    monkeypatch.setattr(module.time, "time", lambda: 1789993000)
+    context = FakeContext()
+    bot = FakeBot()
+    context.platform_manager = types.SimpleNamespace(
+        platform_insts=[FakePlatform(bot, platform_id="napcat-1")],
+    )
+    config = plugin_config()
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    waiting = asyncio.Event()
+    delay_ranges = []
+
+    async def interrupted_guard(**kwargs):
+        delay_ranges.append(kwargs["delay"])
+        if len(delay_ranges) == 2:
+            waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(plugin.guard, "run", interrupted_guard)
+    rows = []
+    tasks = []
+    for flag, applicant, answer in (
+        (1789991000000001, 20001, "2030"),
+        (1789992000000002, 20002, "2028"),
+    ):
+        comment = "问题：（预计）毕业年份\n答案：" + answer
+        request = module.JoinRequest(
+            group_id="123", applicant_qq=str(applicant), answer=answer,
+            flag=str(flag), sub_type="add", requested_at=flag // 1_000_000,
+            raw_comment=comment,
+        )
+        application_id, _ = plugin.audit_store.record_application(
+            platform_id="napcat-1", request=request, question="（预计）毕业年份",
+            question_source="config", review_prompt="规则",
+        )
+        rows.append({
+            "request_id": flag, "invitor_uin": applicant, "group_id": 123,
+            "message": comment, "checked": False, "actor": 0,
+            "requester_nick": "申请人",
+        })
+        tasks.append(asyncio.create_task(plugin._review_application(
+            group_config=module.find_group_config(plugin.config, "123"),
+            request=request, application_id=application_id, platform_id="napcat-1",
+            unified_msg_origin=None, action_source="plugin",
+        )))
+
+    await asyncio.wait_for(waiting.wait(), timeout=2)
+    await plugin.terminate()
+    assert all(task.cancelled() for task in tasks)
+    assert bot.calls == []
+    assert delay_ranges == [(5, 15), (5, 15)]
+
+    # A new instance opens the persisted database and the real platform adapter
+    # sees NapCat's raw payload, including a request handled during the reload.
+    context.llm_calls.clear()
+    rows[1]["checked"] = second_checked
+    bot.response = {"join_requests": rows}
+    plugin = module.QQGroupAuditorPlugin(context, config)
+    resumed_delays = []
+
+    async def resumed_guard(**kwargs):
+        resumed_delays.append(kwargs["delay"])
+        return await kwargs["action"]()
+
+    monkeypatch.setattr(plugin.guard, "run", resumed_guard)
+    await plugin._reconcile_platform("napcat-1")
+    await plugin._reconcile_platform("napcat-1")
+
+    approvals = [call for call in bot.calls if call["action"] == "set_group_add_request"]
+    expected_flags = [str(row["request_id"]) for row in rows if not row["checked"]]
+    assert [call["flag"] for call in approvals] == expected_flags
+    assert all(call["approve"] is True for call in approvals)
+    assert len(context.llm_calls) == len(expected_flags)
+    assert resumed_delays == [(5, 15)] * len(expected_flags)
+    for row in rows:
+        history = plugin.audit_store.history(
+            group_id="123", applicant_qq=str(row["invitor_uin"]),
+        )
+        assert len(history) == 1
+        assert history[0]["request_kind"] == "application"
+        if row["checked"]:
+            assert history[0]["external_checked_at"] == 1789993000
+            assert history[0]["actions"] == []
+        else:
+            assert history[0]["actions"]
+            assert {action["source"] for action in history[0]["actions"]} == {"plugin_catch_up"}
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_catch_up_waits_before_platform_approval(monkeypatch):
     module, _ = import_main(monkeypatch)
     context = FakeContext()
@@ -1278,7 +1375,7 @@ async def test_catch_up_waits_before_platform_approval(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["checked", "disabled", "invite"])
+@pytest.mark.parametrize("case", ["checked", "disabled", "unclassified_inviter"])
 async def test_reconcile_does_not_catch_up_ineligible_request(monkeypatch, case):
     module, _ = import_main(monkeypatch)
     config = plugin_config()
@@ -1294,7 +1391,7 @@ async def test_reconcile_does_not_catch_up_ineligible_request(monkeypatch, case)
         "request_time": 900,
         "checked": case == "checked",
     }
-    if case == "invite":
+    if case == "unclassified_inviter":
         item["invitor_uin"] = 20002
     else:
         item["requester_uin"] = 20002
@@ -1314,6 +1411,9 @@ async def test_reconcile_does_not_catch_up_ineligible_request(monkeypatch, case)
 
     assert context.llm_calls == []
     assert platform_calls == []
+    if case == "unclassified_inviter":
+        assert plugin.audit_store.history(group_id="123", applicant_qq="20002") == []
+        return
     record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
     assert record["actions"] == []
 

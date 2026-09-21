@@ -432,7 +432,7 @@ async def test_system_request_without_time_uses_napcat_sequence_time(monkeypatch
     module, _ = import_main(monkeypatch)
     plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
     await plugin._reconcile_system_request(
-        item={"request_id": "1789989219253793", "group_id": 123, "invitor_uin": 20002, "checked": False},
+        item={"request_id": "1789989219253793", "group_id": 123, "requester_uin": "20002", "checked": False},
         platform_id="napcat-1", now=1789990000, allow_catch_up=False,
     )
     assert record_for(plugin, "1789989219253793")["requested_at"] == 1789989219

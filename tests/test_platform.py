@@ -546,3 +546,41 @@ async def test_napcat_question_and_system_request_extensions():
 
     assert question == "你从哪里知道本群？"
     assert requests[0]["actor"] == 30001
+    assert requests[0]["requester_uin"] == "20001"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"requester_uin": 20001}, "20001"),
+        ({"user_id": 20002}, "20002"),
+        ({"invitor_uin": 20003}, "20003"),
+        ({"requester_uin": 20001, "user_id": 20002, "invitor_uin": 20003}, "20001"),
+        ({"requester_uin": " ", "user_id": 20002, "invitor_uin": 20003}, "20002"),
+        ({"requester_uin": None, "user_id": 0, "invitor_uin": " 20003 "}, "20003"),
+    ],
+)
+async def test_system_requests_normalize_applicant_only_from_join_list(fields, expected):
+    bot = FakeBot()
+    ordinary = {"request_id": 1234, "group_id": 123, "checked": False, **fields}
+    original = dict(ordinary)
+    bot.response = {
+        "join_requests": [ordinary],
+        "InvitedRequest": [{"request_id": 5678, "group_id": 123, "invitor_uin": 30001}],
+        "invited_requests": [{"request_id": 6789, "group_id": 123, "invitor_uin": 30002}],
+    }
+
+    requests = await get_group_system_requests(FakeContext(bot))
+
+    assert requests == [{**original, "requester_uin": expected}]
+    assert ordinary == original
+
+
+@pytest.mark.asyncio
+async def test_system_requests_log_unidentified_applicant(caplog):
+    bot = FakeBot()
+    bot.response = {"join_requests": [None, {"request_id": 1234, "group_id": 123}]}
+
+    assert await get_group_system_requests(FakeContext(bot), platform_id=None) == []
+    assert "群=123，请求=1234，缺少申请人 QQ" in caplog.text

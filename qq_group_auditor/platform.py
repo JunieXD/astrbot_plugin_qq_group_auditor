@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import asyncio
+import logging
 import time
 
 from .models import (
@@ -13,6 +14,9 @@ from .models import (
     JoinRequest,
 )
 from .text import extract_application_answer
+
+
+logger = logging.getLogger(__name__)
 
 
 class PlatformActionError(Exception):
@@ -410,6 +414,12 @@ async def get_group_system_requests(
     platform_id: str | None = None,
     count: int = 100,
 ) -> list[dict[str, Any]]:
+    """Return ordinary join requests with a normalized requester_uin.
+
+    NapCat uses invitor_uin for the applicant in join_requests. Only this
+    list has that meaning; never apply the fallback to invitation lists or
+    live invitation events, where it may identify a different person.
+    """
     bot = find_onebot_bot(context, platform_id=platform_id)
     try:
         data = await bot.call_action(action="get_group_system_msg", count=count)
@@ -418,7 +428,26 @@ async def get_group_system_requests(
     if not isinstance(data, dict):
         raise PlatformActionError("get_group_system_msg returned invalid data")
     requests = data.get("join_requests") or []
-    return [item for item in requests if isinstance(item, dict)]
+    normalized = []
+    for item in requests:
+        if not isinstance(item, dict):
+            continue
+        requester_qq = next(
+            (
+                str(item.get(key) or "").strip()
+                for key in ("requester_uin", "user_id", "invitor_uin")
+                if str(item.get(key) or "").strip()
+            ),
+            "",
+        )
+        if not requester_qq:
+            logger.warning(
+                "群审核后台同步跳过申请：平台=%s，群=%s，请求=%s，缺少申请人 QQ",
+                platform_id, item.get("group_id"), item.get("request_id"),
+            )
+            continue
+        normalized.append({**item, "requester_uin": requester_qq})
+    return normalized
 
 
 async def is_onebot_online(context: Any, *, platform_id: str) -> bool:

@@ -358,7 +358,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.10")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.11")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -1696,10 +1696,11 @@ class QQGroupAuditorPlugin(Star):
     ) -> bool:
         assert self.audit_store is not None
         group_id = str(item.get("group_id") or "").strip()
-        requester_qq = str(
+        # The platform adapter normalizes NapCat's join_requests applicant
+        # field. Do not interpret an unclassified inviter field here.
+        applicant_qq = str(
             item.get("requester_uin") or item.get("user_id") or ""
         ).strip()
-        applicant_qq = requester_qq or str(item.get("invitor_uin") or "").strip()
         flag = str(item.get("request_id") or "").strip()
         group_config = find_group_policy(self.config, group_id)
         if not group_id or not applicant_qq or not flag or group_config is None:
@@ -1755,7 +1756,6 @@ class QQGroupAuditorPlugin(Star):
         enabled_group = find_group_config(self.config, group_id)
         if (
             not allow_catch_up
-            or not requester_qq
             or enabled_group is None
             or self.audit_store.has_review_action(application_id)
         ):
