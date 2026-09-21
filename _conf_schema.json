@@ -197,5 +197,82 @@
         "default": 300
       }
     }
+  },
+  "llm_statistics": {
+    "description": "LLM 调用统计与成本估算",
+    "type": "object",
+    "hint": "仅记录本插件的模型调用。缺失用量显示未知；费用为估算，不包含不可见的内部网络重试。",
+    "items": {
+      "enabled": {
+        "description": "记录 LLM 调用统计",
+        "type": "bool",
+        "default": true
+      },
+      "store_content": {
+        "description": "保存输入提示词与最终输出正文",
+        "type": "bool",
+        "default": false,
+        "hint": "默认仅记录 token、耗时、状态及提示词哈希。不保存思考正文。关闭后不删除此前保存的内容。"
+      },
+      "content_max_chars": {
+        "description": "每个正文字段最多保存字符数",
+        "type": "int",
+        "default": 20000,
+        "hint": "范围 256–200000；截断会标记，不影响实际模型输入。"
+      },
+      "retention_days": {
+        "description": "调用记录保留天数",
+        "type": "int",
+        "default": 90,
+        "hint": "0 表示永久保留，最多 3650 天。启动及有新调用时定期清理过期记录；不影响加群审计历史。"
+      },
+      "prices": {
+        "description": "模型单价（每百万 token）",
+        "type": "template_list",
+        "default": [],
+        "hint": "未配置价格仍记录用量，费用为未知。精确匹配实际模型名；相同模型优先匹配指定 Provider，重复配置使用第一条。支持人民币 CNY、美元 USD，币种分别汇总。",
+        "templates": {
+          "model_price": {
+            "name": "模型计费价格",
+            "display_item": "model",
+            "items": {
+              "provider_id": {
+                "description": "Provider ID（留空适用所有同名模型）",
+                "type": "string",
+                "default": ""
+              },
+              "model": {
+                "description": "模型名称（精确匹配）",
+                "type": "string",
+                "default": ""
+              },
+              "currency": {
+                "description": "币种（三位代码）",
+                "type": "string",
+                "default": "CNY"
+              },
+              "cached_input_per_million": {
+                "description": "缓存命中输入单价",
+                "type": "string",
+                "default": "",
+                "hint": "每百万 token 价格；空白为未知，0 表示免费。"
+              },
+              "uncached_input_per_million": {
+                "description": "缓存未命中输入单价",
+                "type": "string",
+                "default": "",
+                "hint": "每百万 token 价格；空白为未知，0 表示免费。"
+              },
+              "output_per_million": {
+                "description": "输出单价",
+                "type": "string",
+                "default": "",
+                "hint": "输出通常已包含思考 token，不重复计费。"
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

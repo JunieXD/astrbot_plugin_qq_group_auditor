@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ try:
     from .qq_group_auditor.service import AuditService
     from .qq_group_auditor.text import extract_application_answer
     from .qq_group_auditor.pacing import ActionDeferred, delay_range, get_guard
+    from .qq_group_auditor.llm_stats import UsageStore, format_statistics, format_call_detail
 except ImportError:  # pragma: no cover - supports direct local imports in tests/dev.
     from qq_group_auditor.audit_store import AuditStore
     from qq_group_auditor.audit_text import format_detail, format_history
@@ -89,6 +91,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
     from qq_group_auditor.service import AuditService
     from qq_group_auditor.text import extract_application_answer
     from qq_group_auditor.pacing import ActionDeferred, delay_range, get_guard
+    from qq_group_auditor.llm_stats import UsageStore, format_statistics, format_call_detail
 
 
 logger = logging.getLogger(__name__)
@@ -142,25 +145,70 @@ def qgaudit():
 
 
 class AstrBotLLMClient:
-    def __init__(self, context: Context, umo: str | None = None) -> None:
+    def __init__(self, context: Context, umo: str | None = None, *,
+                 statistics: UsageStore | None = None, tasks: set | None = None,
+                 application_id: int | None = None, platform_id: str = "",
+                 group_id: str = "", source: str = "test") -> None:
         self.context = context
         self.umo = umo
+        self.statistics = statistics
+        self.tasks = tasks
+        self.metadata = dict(application_id=application_id, platform_id=platform_id or "",
+                             group_id=group_id, source=source, review_id=uuid.uuid4().hex)
+        self.attempt = 0
+        self.last_call_id: int | None = None
 
     async def generate(self, *, system_prompt: str, prompt: str) -> str:
-        chat_provider_id = await self._provider_id()
-        generation_options: dict[str, Any] = {}
-        if _is_deepseek_provider_id(chat_provider_id):
-            generation_options = {
-                "response_format": {"type": "json_object"},
-                "max_tokens": _DEEPSEEK_JSON_MAX_TOKENS,
-            }
-        response = await self.context.llm_generate(
-            chat_provider_id=chat_provider_id,
-            system_prompt=system_prompt,
-            prompt=prompt,
-            **generation_options,
-        )
-        return str(getattr(response, "completion_text", ""))
+        task = asyncio.current_task()
+        if self.tasks is not None:
+            self.tasks.add(task)
+        self.last_call_id = None
+        started = None
+        response = None
+        status, error_type = "provider_error", ""
+        try:
+            chat_provider_id = await self._provider_id()
+            generation_options: dict[str, Any] = {}
+            if _is_deepseek_provider_id(chat_provider_id):
+                generation_options = {
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": _DEEPSEEK_JSON_MAX_TOKENS,
+                }
+            self.attempt += 1
+            if self.statistics is not None:
+                model = ""
+                with contextlib.suppress(Exception):
+                    provider = self.context.get_provider_by_id(chat_provider_id)
+                    model = str(provider.get_model() or "")[:256]
+                self.last_call_id = self.statistics.begin(
+                    **self.metadata, attempt=self.attempt, provider_id=str(chat_provider_id),
+                    model=model, model_source="configured" if model else "unknown",
+                    system_prompt=system_prompt, prompt=prompt,
+                )
+            started = time.perf_counter()
+            response = await self.context.llm_generate(
+                chat_provider_id=chat_provider_id,
+                system_prompt=system_prompt, prompt=prompt, **generation_options,
+            )
+            status = "returned"
+            return str(getattr(response, "completion_text", ""))
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        except Exception as exc:
+            error_type = type(exc).__name__
+            raise
+        finally:
+            if self.statistics is not None and started is not None:
+                self.statistics.finish(self.last_call_id, status=status, response=response,
+                                       duration_ms=(time.perf_counter() - started) * 1000,
+                                       error_type=error_type)
+            if self.tasks is not None:
+                self.tasks.discard(task)
+
+    def response_parsed(self, status: str) -> None:
+        if self.statistics is not None:
+            self.statistics.parsed(self.last_call_id, status)
 
     async def _provider_id(self) -> Any:
         if self.umo and hasattr(self.context, "get_current_chat_provider_id"):
@@ -180,8 +228,10 @@ class AstrBotLLMClient:
 
 
 class RuntimeReviewer:
-    def __init__(self, context: Context, umo: str | None = None) -> None:
-        self.client = AstrBotLLMClient(context, umo)
+    def __init__(self, context: Context, umo: str | None = None, **statistics_options) -> None:
+        self.context = context
+        self.umo = umo
+        self.statistics_options = statistics_options
 
     async def review(
         self,
@@ -189,12 +239,15 @@ class RuntimeReviewer:
         group_config: dict[str, Any],
         request: JoinRequest,
     ) -> ReviewDecision:
+        client = AstrBotLLMClient(self.context, self.umo, group_id=request.group_id,
+                                 **self.statistics_options)
         return await review_answer(
-            self.client,
+            client,
             group_id=request.group_id,
             applicant_qq=request.applicant_qq,
             answer=request.answer,
             review_prompt=str(group_config.get("review_prompt") or ""),
+            on_response=client.response_parsed,
         )
 
 
@@ -358,7 +411,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.11")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.3.0")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -375,6 +428,7 @@ class QQGroupAuditorPlugin(Star):
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
         self._action_tasks: set[asyncio.Task] = set()
+        self._llm_tasks: set[asyncio.Task] = set()
         self._stopped = False
         self._lookup_cache: dict[tuple, tuple[float, Any]] = {}
         self._lookup_locks: dict[tuple, asyncio.Lock] = {}
@@ -384,6 +438,13 @@ class QQGroupAuditorPlugin(Star):
         except Exception:
             logger.exception("failed to initialize audit database")
             self.audit_store = None
+        try:
+            path = _audit_database_path()
+            stats_path = ":memory:" if str(path) == ":memory:" else Path(path).with_name("llm_usage.sqlite3")
+            self.usage_store: UsageStore | None = UsageStore(stats_path, self.config["llm_statistics"])
+        except Exception:
+            logger.exception("无法初始化 LLM 统计数据库，审核继续")
+            self.usage_store = None
 
     async def initialize(self) -> None:
         if self.audit_store is not None and self._reconcile_task is None:
@@ -391,7 +452,7 @@ class QQGroupAuditorPlugin(Star):
 
     async def terminate(self) -> None:
         self._stopped = True
-        tasks = list(self._action_tasks)
+        tasks = list(self._action_tasks | self._llm_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -417,6 +478,9 @@ class QQGroupAuditorPlugin(Star):
         if self.audit_store is not None:
             self.audit_store.close()
             self.audit_store = None
+        if self.usage_store is not None:
+            self.usage_store.close()
+            self.usage_store = None
 
     async def _run_guarded(self, platform_id, action, *, delay, gap=None, key=None,
                            dedup_seconds=604800, priority=1, group=None, label="自动操作"):
@@ -743,7 +807,9 @@ class QQGroupAuditorPlugin(Star):
             else 0.0
         )
         service = AuditService(
-            RuntimeReviewer(self.context, unified_msg_origin),
+            RuntimeReviewer(self.context, unified_msg_origin, statistics=self.usage_store,
+                            tasks=self._llm_tasks, application_id=application_id,
+                            platform_id=platform_id, source=action_source),
             RuntimePlatform(
                 self.context,
                 platform_id=platform_id,
@@ -1601,6 +1667,8 @@ class QQGroupAuditorPlugin(Star):
     async def _reconcile_loop(self) -> None:
         while True:
             try:
+                if self.usage_store is not None:
+                    self.usage_store.maintenance()
                 if self.audit_store is not None:
                     platform_ids = onebot_platform_ids(self.context)
                     for platform_id in platform_ids:
@@ -1805,6 +1873,8 @@ class QQGroupAuditorPlugin(Star):
             decision = await RuntimeReviewer(
                 self.context,
                 getattr(event, "unified_msg_origin", None),
+                statistics=self.usage_store, tasks=self._llm_tasks,
+                platform_id=_platform_id(event), source="test",
             ).review(
                 group_config=group_config,
                 request=request,
@@ -1918,4 +1988,67 @@ class QQGroupAuditorPlugin(Star):
             logger.exception("failed to query audit detail")
             yield event.plain_result("查询审计记录失败")
             return
-        yield event.plain_result(format_detail(record))
+        text = format_detail(record)
+        if record and self.usage_store is not None:
+            try:
+                calls = self.usage_store.query(group_ids=[group_id], application_id=application_id)
+                text += format_call_detail(calls)
+            except Exception:
+                logger.warning("查询 LLM 调用详情失败", exc_info=True)
+                text += "\nLLM 统计暂时不可用。"
+        yield event.plain_result(text)
+
+    def _statistics_query(self, event: Any) -> tuple[list[dict], int]:
+        parts = _event_message_text(event).strip().split()
+        if len(parts) < 2 or parts[0].lstrip("/") != "qgaudit" or parts[1] not in {"stats", "export"}:
+            raise ValueError("用法：/qgaudit stats|export [7d] [群号|all] [模型名]")
+        args = parts[2:]
+        if len(args) > 3 or (args and not re.fullmatch(r"[0-9]{1,4}d?", args[0])):
+            raise ValueError("用法：/qgaudit stats|export [7d] [群号|all] [模型名]")
+        days = int(args[0].removesuffix("d")) if args else 7
+        if not 1 <= days <= 3650:
+            raise ValueError("天数应在 1–3650 之间")
+        requested = args[1] if len(args) > 1 else "all"
+        groups = sorted({g["group_id"] for g in self.config["group_audits"]
+                         if is_group_admin(self.config, g["group_id"], _sender_id(event))})
+        if requested != "all":
+            groups = [requested] if requested in groups else []
+        if not groups:
+            raise ValueError("无权限")
+        if self.usage_store is None:
+            raise ValueError("LLM 统计数据库不可用")
+        rows = self.usage_store.query(group_ids=groups, since=time.time() - days * 86400,
+                                      model=args[2] if len(args) > 2 else None)
+        return rows, days
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @qgaudit.command("stats")
+    async def qgaudit_stats(self, event: Any) -> None:
+        try:
+            rows, days = await asyncio.to_thread(self._statistics_query, event)
+            text = format_statistics(rows, days=days, enabled=self.config["llm_statistics"]["enabled"])
+        except ValueError as exc:
+            text = str(exc)
+        except Exception:
+            logger.warning("查询 LLM 统计失败", exc_info=True)
+            text = "查询 LLM 统计失败，请查看日志"
+        yield event.plain_result(text)
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @qgaudit.command("export")
+    async def qgaudit_export(self, event: Any) -> None:
+        try:
+            rows, _ = await asyncio.to_thread(self._statistics_query, event)
+            if not rows:
+                yield event.plain_result("所选范围没有可导出的 LLM 调用记录")
+                return
+            from astrbot.api.message_components import File
+            assert self.usage_store is not None
+            directory = Path(_audit_database_path()).parent / "llm_exports"
+            path = await asyncio.to_thread(self.usage_store.export_csv, rows, directory)
+            yield event.chain_result([File(name=path.name, file=str(path.resolve()))])
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+        except Exception:
+            logger.warning("导出 LLM 统计失败", exc_info=True)
+            yield event.plain_result("导出 LLM 统计失败，请查看日志")
