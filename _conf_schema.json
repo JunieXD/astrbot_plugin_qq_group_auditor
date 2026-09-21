@@ -50,6 +50,18 @@
             "default": "ignore",
             "hint": "填写 approve、ignore 或 reject。受邀请求不调用 LLM；approve 等待随机审核延迟后通过且不自动改群名片。NapCat 不提供邀请标记，插件仅将原始申请附言完全为空的请求识别为受邀入群。"
           },
+          "review_min_seconds": {
+            "description": "本群审核等待最小秒数",
+            "type": "int",
+            "default": -1,
+            "hint": "-1 表示继承全局审核等待；适用于主动申请、受邀入群和补审。各群仍共用账号操作间隔。"
+          },
+          "review_max_seconds": {
+            "description": "本群审核等待最大秒数",
+            "type": "int",
+            "default": -1,
+            "hint": "-1 表示继承全局；小于最小秒数时按最小值处理。等待到期后参与审批优先、按群轮转的调度。"
+          },
           "reject_reason": {
             "description": "固定拒绝理由",
             "type": "text",
@@ -112,12 +124,12 @@
       "review_min_seconds": {
         "description": "自动审核等待最小秒数",
         "type": "int",
-        "default": 15
+        "default": 5
       },
       "review_max_seconds": {
         "description": "自动审核等待最大秒数",
         "type": "int",
-        "default": 45
+        "default": 15
       },
       "card_min_seconds": {
         "description": "确认入群后名片等待最小秒数",

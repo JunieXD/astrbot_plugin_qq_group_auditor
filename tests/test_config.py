@@ -6,7 +6,25 @@ from qq_group_auditor.config import (
     find_group_config,
     is_group_admin,
     normalize_config,
+    review_delay,
 )
+
+import pytest
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, (5, 15)),
+    ({"review_min_seconds": 20, "review_max_seconds": 40}, (20, 40)),
+    ({"review_min_seconds": -1, "review_max_seconds": 30}, (5, 30)),
+    ({"review_min_seconds": 25, "review_max_seconds": -1}, (25, 25)),
+    ({"review_min_seconds": "nan", "review_max_seconds": "invalid"}, (5, 15)),
+    ({"review_min_seconds": 10, "review_max_seconds": 2}, (10, 10)),
+])
+def test_group_review_delay_inherits_and_normalizes(overrides, expected):
+    config = normalize_config({"automation_pacing": {"review_min_seconds": 5, "review_max_seconds": 15},
+                               "group_audits": [{"group_id": "123", **overrides}]})
+    assert review_delay(config, config["group_audits"][0]) == expected
+    assert config["automation_pacing"]["action_gap_min_seconds"] == 8
 
 
 def test_normalize_config_adds_defaults():

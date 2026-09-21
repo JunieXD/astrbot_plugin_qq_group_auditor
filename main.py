@@ -22,6 +22,7 @@ try:
         find_group_policy,
         is_group_admin,
         normalize_config,
+        review_delay,
     )
     from .qq_group_auditor.models import (
         ActionResult,
@@ -59,6 +60,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
         find_group_policy,
         is_group_admin,
         normalize_config,
+        review_delay,
     )
     from qq_group_auditor.models import (
         ActionResult,
@@ -356,7 +358,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.9")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.2.10")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -416,10 +418,14 @@ class QQGroupAuditorPlugin(Star):
             self.audit_store.close()
             self.audit_store = None
 
-    async def _run_guarded(self, platform_id, action, *, delay, gap=None, key=None, dedup_seconds=604800):
+    async def _run_guarded(self, platform_id, action, *, delay, gap=None, key=None,
+                           dedup_seconds=604800, priority=1, group=None, label="自动操作"):
         if self._stopped:
             raise ActionDeferred("插件正在重载")
         pacing = self.config["automation_pacing"]
+        account_gap = delay_range(pacing, "action_gap")
+        spacing = tuple(max(account, operation) for account, operation
+                        in zip(account_gap, gap or account_gap))
         task = asyncio.current_task()
         self._action_tasks.add(task)
         async def checked_action():
@@ -431,10 +437,13 @@ class QQGroupAuditorPlugin(Star):
                 account=platform_id or "aiocqhttp",
                 online=lambda: is_onebot_online(self.context, platform_id=platform_id or "aiocqhttp"),
                 action=checked_action, config=pacing, delay=delay,
-                gap=gap or delay_range(pacing, "action_gap"), key=key,
+                gap=spacing, key=key,
                 dedup_seconds=dedup_seconds,
+                priority=priority, group=group, label=label,
             )
         except self.guard.deferred_error as exc:
+            logger.info("QQ 操作暂缓或跳过：账号=%s，任务=%s，群=%s，原因=%s",
+                        platform_id, label, group or "其他", exc)
             raise ActionDeferred(str(exc)) from exc
         finally:
             self._action_tasks.discard(task)
@@ -455,6 +464,7 @@ class QQGroupAuditorPlugin(Star):
                     send,
                     delay=delay_range(pacing, "notice"), gap=delay_range(pacing, "notice"),
                     key=f"notice:{qq_id}:{text}", dedup_seconds=pacing["notice_dedup_seconds"],
+                    priority=2, group=group_config.get("group_id"), label="管理员通知",
                 )
             except ActionDeferred:
                 if check_request is not None:
@@ -741,8 +751,10 @@ class QQGroupAuditorPlugin(Star):
                 executor=lambda req, **kw: self._run_guarded(
                     platform_id,
                     lambda: self._execute_review_action(req, application_id, platform_id, source=action_source, **kw),
-                    delay=delay_range(self.config["automation_pacing"], "review"),
+                    delay=review_delay(self.config, group_config),
                     key=f"review:{req.group_id}:{req.applicant_qq}:{req.flag}",
+                    priority=0, group=req.group_id,
+                    label=f"{'邀请' if req.request_kind == 'invite' else '申请'}审批 #{application_id}",
                 ),
             ),
             RuntimeNotifier(
@@ -1206,6 +1218,7 @@ class QQGroupAuditorPlugin(Star):
             return member
         return await self._run_guarded(
             platform_id, write, delay=delay_range(self.config["automation_pacing"], "card"),
+            priority=1, group=group_id, label="修改群名片",
         )
 
     async def _set_card_from_application(

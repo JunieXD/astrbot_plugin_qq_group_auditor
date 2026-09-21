@@ -326,7 +326,8 @@ async def test_concurrent_duplicate_keys_do_not_send_twice(manual_runtime):
 
 
 @pytest.mark.asyncio
-async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_exception(manual_runtime):
+@pytest.mark.parametrize("old_version", [1, 2])
+async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_exception(manual_runtime, old_version):
     guard, clock = manual_runtime
     spec = importlib.util.spec_from_file_location("older_plugin_pacing", pacing.__file__)
     older = importlib.util.module_from_spec(spec)
@@ -335,7 +336,7 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
     entered, release = asyncio.Event(), asyncio.Event()
 
     class LegacyGuard(older.ActionGuard):
-        scheduling_version = 1
+        scheduling_version = old_version
 
         async def run_old_call(self):
             async with self.locks.setdefault("bot", asyncio.Lock()):
@@ -348,6 +349,8 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
                     return "deferred"
 
     legacy = LegacyGuard(guard.path)
+    for name in ("_pending", "_changed", "_last_served", "_sequence"):
+        delattr(legacy, name)
     manager = SimpleNamespace(_qq_automation_guard_v1=legacy)
     running = asyncio.create_task(legacy.run_old_call())
     await entered.wait()
@@ -356,7 +359,7 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
     assert upgraded is legacy
     assert upgraded.locks is locks and upgraded.accounts is accounts
     assert upgraded.deferred_error is old_error
-    assert upgraded.scheduling_version == 2
+    assert upgraded.scheduling_version == 3
     calls = []
 
     async def action():
@@ -374,3 +377,117 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
         await pending
     assert upgraded.accounts["bot"].get("failures", 0) == 0
     assert upgraded.accounts["bot"]["operations"] == {}
+
+
+@pytest.mark.asyncio
+async def test_ready_tasks_prioritize_approvals_and_rotate_groups(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def record(name):
+        calls.append((name, clock.now))
+
+    # Deliberately enqueue cards/notices first and a burst from group A before B.
+    tasks = [asyncio.create_task(guard.run(
+        account="bot", online=online, action=lambda name=name: record(name),
+        config=CONFIG, delay=(5, 5), gap=(10, 10), priority=priority, group=group,
+    )) for name, priority, group in (
+        ("card", 1, "A"), ("notice", 2, "A"),
+        ("A1", 0, "A"), ("A2", 0, "A"), ("B1", 0, "B"), ("B2", 0, "B"),
+    )]
+    await clock.settle()
+    await clock.advance(5)
+    for _ in range(5):
+        await clock.advance(10)
+    await asyncio.gather(*tasks)
+    assert [name for name, _ in calls] == ["A1", "B1", "A2", "B2", "card", "notice"]
+    assert all(b[1] - a[1] >= 10 for a, b in zip(calls, calls[1:]))
+
+
+@pytest.mark.asyncio
+async def test_priority_never_ignores_request_own_delay(manual_runtime):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def record(name):
+        calls.append((name, clock.now))
+
+    urgent = asyncio.create_task(guard.run(
+        account="bot", online=online, action=lambda: record("approval"),
+        config=CONFIG, priority=0, delay=(60, 60), gap=(10, 10), group="B"))
+    ready = asyncio.create_task(guard.run(
+        account="bot", online=online, action=lambda: record("card"),
+        config=CONFIG, priority=1, delay=(5, 5), gap=(10, 10), group="A"))
+    await clock.settle()
+    await clock.advance(5)
+    assert calls == [("card", 1005)]
+    await clock.advance(55)
+    await asyncio.gather(urgent, ready)
+    assert calls == [("card", 1005), ("approval", 1060)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("priority,expected_wait", [(1, 60), (2, 120)])
+async def test_aging_prevents_lower_priority_starvation(manual_runtime, priority, expected_wait):
+    guard, clock = manual_runtime
+    calls = []
+
+    async def record(name):
+        calls.append((name, clock.now))
+
+    tasks = [asyncio.create_task(guard.run(
+        account="bot", online=online, action=lambda: record("low"),
+        config=CONFIG, priority=priority, group="low", gap=(10, 10)))]
+    tasks.extend(asyncio.create_task(guard.run(
+        account="bot", online=online, action=lambda: record("approval"),
+        config=CONFIG, priority=0, group="busy", gap=(10, 10),
+    )) for _ in range(15))
+    await clock.settle()
+    for _ in range(15):
+        await clock.advance(10)
+    await asyncio.gather(*tasks)
+    assert next(when for name, when in calls if name == "low") == 1000 + expected_wait
+
+
+@pytest.mark.asyncio
+async def test_cancelling_selected_waiter_wakes_other_groups(manual_runtime):
+    guard, clock = manual_runtime
+    release = asyncio.Event()
+    calls = []
+
+    async def blocking():
+        await release.wait()
+
+    async def record(name):
+        calls.append(name)
+
+    running = asyncio.create_task(guard.run(account="bot", online=online,
+        action=blocking, config=CONFIG, gap=(10, 10)))
+    await clock.settle()
+    cancelled = asyncio.create_task(guard.run(account="bot", online=online,
+        action=lambda: record("cancelled"), config=CONFIG, priority=0, group="A", gap=(10, 10)))
+    other = asyncio.create_task(guard.run(account="bot", online=online,
+        action=lambda: record("other"), config=CONFIG, priority=1, group="B", gap=(10, 10)))
+    await clock.settle()
+    cancelled.cancel()
+    await asyncio.gather(cancelled, return_exceptions=True)
+    release.set()
+    await clock.settle()
+    await clock.advance(10)
+    await asyncio.gather(running, other)
+    assert calls == ["other"]
+    assert guard._pending["bot"] == []
+
+
+@pytest.mark.asyncio
+async def test_queue_logs_explain_delay_and_start_without_leaking_keys(runtime, caplog):
+    guard, _, _ = runtime
+    async def action():
+        pass
+    with caplog.at_level("INFO"):
+        await guard.run(**options(action, group="123", priority=0, label="邀请审批 #42", key="private-content"))
+    assert "QQ 操作入队" in caplog.text
+    assert "随机延迟" in caplog.text
+    assert "累计等待=15.0 秒" in caplog.text
+    assert "邀请审批 #42" in caplog.text
+    assert "private-content" not in caplog.text

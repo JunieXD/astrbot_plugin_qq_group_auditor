@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from typing import Any
 
 from .pacing import normalize_pacing
@@ -12,7 +13,7 @@ DEFAULT_REVIEW_PROMPT = (
 )
 DEFAULT_CARD_TEMPLATE = "{nickname}"
 DEFAULT_PACING = {
-    "review_min_seconds": 15, "review_max_seconds": 45,
+    "review_min_seconds": 5, "review_max_seconds": 15,
     "card_min_seconds": 30, "card_max_seconds": 90,
     "action_gap_min_seconds": 8, "action_gap_max_seconds": 15,
     "notice_min_seconds": 10, "notice_max_seconds": 20,
@@ -85,6 +86,8 @@ def normalize_group_item(item: dict[str, Any]) -> dict[str, Any] | None:
         or DEFAULT_REVIEW_PROMPT,
         "failure_action": failure_action,
         "invite_action": invite_action,
+        "review_min_seconds": _review_override(item.get("review_min_seconds")),
+        "review_max_seconds": _review_override(item.get("review_max_seconds")),
         "reject_reason": reject_reason,
         "admin_qq_ids": normalize_admin_ids(item.get("admin_qq_ids")),
         "notify_on_approve": normalize_bool(item.get("notify_on_approve")),
@@ -99,6 +102,25 @@ def normalize_group_item(item: dict[str, Any]) -> dict[str, Any] | None:
         or DEFAULT_CARD_TEMPLATE,
         "application_question": str(item.get("application_question") or "").strip(),
     }
+
+
+def _review_override(value: Any) -> float:
+    try:
+        seconds = float(value)
+        if math.isfinite(seconds) and seconds >= 0:
+            return min(86400, seconds)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return -1
+
+
+def review_delay(config: dict[str, Any], group: dict[str, Any]) -> tuple[float, float]:
+    """Per-group overrides inherit each endpoint from the global review delay."""
+    values = []
+    for name in ("review_min_seconds", "review_max_seconds"):
+        override = _review_override(group.get(name))
+        values.append(config["automation_pacing"][name] if override < 0 else override)
+    return values[0], max(values)
 
 
 def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:

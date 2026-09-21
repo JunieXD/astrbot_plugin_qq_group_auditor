@@ -252,7 +252,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.9"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.2.10"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -1274,7 +1274,7 @@ async def test_catch_up_waits_before_platform_approval(monkeypatch):
     )
 
     assert result.platform_status == "succeeded"
-    assert events == [("delay_range", (15, 45)), ("approve", "paced-catch-up")]
+    assert events == [("delay_range", (5, 15)), ("approve", "paced-catch-up")]
 
 
 @pytest.mark.asyncio

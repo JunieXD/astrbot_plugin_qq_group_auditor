@@ -18,6 +18,9 @@ def test_conf_schema_is_valid_json_and_uses_supported_types():
     assert items["failure_action"]["type"] == "string"
     assert items["invite_action"]["type"] == "string"
     assert items["invite_action"]["default"] == "ignore"
+    for name in ("review_min_seconds", "review_max_seconds"):
+        assert items[name]["type"] == "int"
+        assert items[name]["default"] == -1
     assert items["admin_qq_ids"]["type"] == "list"
     assert items["notify_on_approve"]["type"] == "bool"
     assert items["notify_on_reject"]["type"] == "bool"

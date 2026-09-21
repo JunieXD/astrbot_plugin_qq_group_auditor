@@ -29,6 +29,48 @@ async def test_invitation_keeps_policy_but_uses_configured_delay(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_invitation_uses_group_delay_and_approval_priority(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["group_audits"][0].update(invite_action="approve", review_min_seconds=20, review_max_seconds=25)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    queued = []
+
+    async def guarded(**kwargs):
+        queued.append((kwargs["group"], kwargs["priority"], kwargs["delay"], kwargs["gap"]))
+        return await kwargs["action"]()
+
+    async def write(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(plugin.guard, "run", guarded)
+    monkeypatch.setattr(module, "set_group_request", write)
+    event = FakeRequestEvent()
+    event.message_obj.raw_message["comment"] = ""
+    await plugin.handle_group_request(event)
+    assert queued == [("123", 0, (20, 25), (8, 15))]
+    assert not plugin.context.llm_calls
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_notice_cannot_shorten_configured_account_gap(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config["automation_pacing"] = {"action_gap_min_seconds": 30, "action_gap_max_seconds": 40}
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    queued = []
+
+    async def guarded(**kwargs):
+        queued.append((kwargs["group"], kwargs["priority"], kwargs["gap"]))
+
+    monkeypatch.setattr(plugin.guard, "run", guarded)
+    await plugin._send_notice(plugin.config["group_audits"][0], "test", "bot")
+    assert queued == [("123", 2, (30, 40))]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_existing_card_is_rechecked_after_wait_and_preserved(monkeypatch):
     module, _ = import_main(monkeypatch)
     config = plugin_config()
