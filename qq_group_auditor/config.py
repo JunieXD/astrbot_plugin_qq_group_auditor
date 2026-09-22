@@ -6,6 +6,7 @@ from typing import Any
 
 from .pacing import normalize_pacing
 from .llm_usage import normalize_statistics
+from .llm_options import normalize_llm_review
 
 
 DEFAULT_REJECT_REASON = "加群答案不符合要求，请重新申请并按提示填写。"
@@ -148,6 +149,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     config["background_sync_interval_seconds"] = max(300, min(86400, interval))
     config["automation_pacing"] = normalize_pacing(config.get("automation_pacing"), DEFAULT_PACING)
     config["llm_statistics"] = normalize_statistics(config.get("llm_statistics"))
+    config["llm_review"] = normalize_llm_review(config.get("llm_review"))
     return config
 
 

@@ -274,5 +274,48 @@
         }
       }
     }
+  },
+  "llm_review": {
+    "description": "审核模型与 ECNU 请求设置（仅本插件）",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "审核专用模型",
+        "type": "string",
+        "default": "",
+        "hint": "填写 AstrBot 模型 ID，例如 ecnu/ecnu-plus；留空使用当前会话或默认模型。仅影响本插件的实时审核、补审与测试。",
+        "_special": "select_provider"
+      },
+      "ecnu_structured_output": {
+        "description": "ECNU 审核启用 JSON Schema",
+        "type": "bool",
+        "default": true,
+        "hint": "仅对 ecnu-plus / ecnu-max 生效，约束 approve 和 reason；关闭时本插件请求不携带 response_format。"
+      },
+      "ecnu_thinking": {
+        "description": "ECNU 审核思考模式",
+        "type": "string",
+        "default": "inherit",
+        "options": [
+          "inherit",
+          "enabled",
+          "disabled"
+        ],
+        "hint": "inherit 继承共享模型；enabled 开启；disabled 关闭。后两者仅覆盖本插件的请求。"
+      },
+      "ecnu_reasoning_effort": {
+        "description": "ECNU 审核思考程度",
+        "type": "string",
+        "default": "low",
+        "options": [
+          "low",
+          "medium",
+          "xhigh",
+          "high",
+          "max"
+        ],
+        "hint": "仅在本插件开启思考时生效。Plus 支持 low / medium / xhigh；Max 支持 low / high / max。推荐 low。不支持的组合会报错，不会静默换档。"
+      }
+    }
   }
 }

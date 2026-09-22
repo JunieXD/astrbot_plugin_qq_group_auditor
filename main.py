@@ -53,6 +53,7 @@ try:
     from .qq_group_auditor.text import extract_application_answer
     from .qq_group_auditor.pacing import ActionDeferred, delay_range, get_guard
     from .qq_group_auditor.llm_stats import UsageStore, format_statistics, format_call_detail
+    from .qq_group_auditor.llm_options import normalize_llm_review, ecnu_request_provider, review_completion_text
 except ImportError:  # pragma: no cover - supports direct local imports in tests/dev.
     from qq_group_auditor.audit_store import AuditStore
     from qq_group_auditor.audit_text import format_detail, format_history
@@ -92,6 +93,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
     from qq_group_auditor.text import extract_application_answer
     from qq_group_auditor.pacing import ActionDeferred, delay_range, get_guard
     from qq_group_auditor.llm_stats import UsageStore, format_statistics, format_call_detail
+    from qq_group_auditor.llm_options import normalize_llm_review, ecnu_request_provider, review_completion_text
 
 
 logger = logging.getLogger(__name__)
@@ -147,7 +149,8 @@ class AstrBotLLMClient:
     def __init__(self, context: Context, umo: str | None = None, *,
                  statistics: UsageStore | None = None, tasks: set | None = None,
                  application_id: int | None = None, platform_id: str = "",
-                 group_id: str = "", source: str = "test") -> None:
+                 group_id: str = "", source: str = "test",
+                 llm_options: dict | None = None, limiter: asyncio.Semaphore | None = None) -> None:
         self.context = context
         self.umo = umo
         self.statistics = statistics
@@ -156,6 +159,8 @@ class AstrBotLLMClient:
                              group_id=group_id, source=source, review_id=uuid.uuid4().hex)
         self.attempt = 0
         self.last_call_id: int | None = None
+        self.options = normalize_llm_review(llm_options)
+        self.limiter = limiter
 
     async def generate(self, *, system_prompt: str, prompt: str) -> str:
         task = asyncio.current_task()
@@ -165,8 +170,12 @@ class AstrBotLLMClient:
         started = None
         response = None
         status, error_type = "provider_error", ""
+        acquired = False
         try:
             chat_provider_id = await self._provider_id()
+            if self.limiter is not None:
+                await self.limiter.acquire()
+                acquired = True
             generation_options: dict[str, Any] = {}
             if _is_deepseek_provider_id(chat_provider_id):
                 generation_options = {
@@ -184,12 +193,19 @@ class AstrBotLLMClient:
                     system_prompt=system_prompt, prompt=prompt,
                 )
             started = time.perf_counter()
-            response = await self.context.llm_generate(
-                chat_provider_id=chat_provider_id,
-                system_prompt=system_prompt, prompt=prompt, **generation_options,
-            )
+            provider = None
+            if hasattr(self.context, "get_provider_by_id"):
+                provider = self.context.get_provider_by_id(chat_provider_id)
+            local_provider = ecnu_request_provider(provider, self.options)
+            if local_provider is not None:
+                response = await local_provider.text_chat(system_prompt=system_prompt, prompt=prompt)
+            else:
+                response = await self.context.llm_generate(
+                    chat_provider_id=chat_provider_id,
+                    system_prompt=system_prompt, prompt=prompt, **generation_options,
+                )
             status = "returned"
-            return str(getattr(response, "completion_text", ""))
+            return review_completion_text(response)
         except asyncio.CancelledError:
             status = "cancelled"
             raise
@@ -197,6 +213,8 @@ class AstrBotLLMClient:
             error_type = type(exc).__name__
             raise
         finally:
+            if acquired:
+                self.limiter.release()
             if self.statistics is not None and started is not None:
                 self.statistics.finish(self.last_call_id, status=status, response=response,
                                        duration_ms=(time.perf_counter() - started) * 1000,
@@ -209,6 +227,8 @@ class AstrBotLLMClient:
             self.statistics.parsed(self.last_call_id, status)
 
     async def _provider_id(self) -> Any:
+        if self.options["provider_id"]:
+            return self.options["provider_id"]
         if self.umo and hasattr(self.context, "get_current_chat_provider_id"):
             try:
                 provider_id = await self.context.get_current_chat_provider_id(self.umo)
@@ -409,7 +429,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.3.1")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.4.0")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -427,6 +447,7 @@ class QQGroupAuditorPlugin(Star):
         self._backfill_locks: dict[str, asyncio.Lock] = {}
         self._action_tasks: set[asyncio.Task] = set()
         self._llm_tasks: set[asyncio.Task] = set()
+        self._llm_limiter = asyncio.Semaphore(3)
         self._stopped = False
         self._lookup_cache: dict[tuple, tuple[float, Any]] = {}
         self._lookup_locks: dict[tuple, asyncio.Lock] = {}
@@ -806,6 +827,7 @@ class QQGroupAuditorPlugin(Star):
         )
         service = AuditService(
             RuntimeReviewer(self.context, unified_msg_origin, statistics=self.usage_store,
+                            llm_options=self.config["llm_review"], limiter=self._llm_limiter,
                             tasks=self._llm_tasks, application_id=application_id,
                             platform_id=platform_id, source=action_source),
             RuntimePlatform(
@@ -1872,6 +1894,7 @@ class QQGroupAuditorPlugin(Star):
                 self.context,
                 getattr(event, "unified_msg_origin", None),
                 statistics=self.usage_store, tasks=self._llm_tasks,
+                llm_options=self.config["llm_review"], limiter=self._llm_limiter,
                 platform_id=_platform_id(event), source="test",
             ).review(
                 group_config=group_config,

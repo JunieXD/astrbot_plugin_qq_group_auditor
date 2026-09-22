@@ -63,6 +63,25 @@ NapCat 当前群系统消息接口只能说明申请是否已处理以及操作�
 
 后台同步默认每 600 秒加 0–300 秒随机等待执行一次，通过 `background_sync_interval_seconds` 调整（最少 300 秒）。同步前只读取 NapCat 的本地在线状态；掉线、断开连接或接口失败后延长重试间隔，默认最长 1 小时，不再每分钟请求 QQ 或反复打印异常堆栈。历史查询共用同步间隔和锁，不会触发额外并发轮询；只从当前适配器发现平台，不再使用数据库里过期的平台 ID 轮询。`background_sync_enabled=false` 可关闭后台申请同步和定时名片补处理，实时审核、空答案等待及实时入退群处理继续生效。
 
+## 审核专用模型与 ECNU 设置
+
+在插件配置的 `llm_review` 中设置，仅影响本插件的实时审核、补审和 `/qgaudit test`：
+
+| 参数 | 默认 | 作用 |
+| --- | --- | --- |
+| `provider_id` | 空 | 指定 AstrBot 模型 ID，例如 `ecnu/ecnu-plus`；留空继承当前会话或默认模型。 |
+| `ecnu_structured_output` | `true` | 对 ECNU Plus / Max 使用 JSON Schema，固定 `approve` 布尔值及 `reason` 字符串，禁止额外字段。关闭时审核请求不传 `response_format`。 |
+| `ecnu_thinking` | `inherit` | `inherit` 继承共享模型设置；`enabled` 开启；`disabled` 关闭。 |
+| `ecnu_reasoning_effort` | `low` | 仅在本插件设置 `enabled` 时覆盖档位。Plus 支持 `low/medium/xhigh`，Max 支持 `low/high/max`。 |
+
+推荐 ECNU Plus 开启 `low` 思考和 JSON Schema。配置适用于本插件管理的所有群，但各群仍使用自己的审核提示词。学校群可参考 [非985非211提示词](docs/prompts/non985-non211.txt)，其他群无需改动规则。这份规则允许非985非211的双一流高校；“待确认”输出为 `approve=false`，随后遵循该群 `failure_action`，不是独立人工审核队列。
+
+部分 AstrBot 4.x 版本会丢弃 `llm_generate` 的生成参数。插件为 ECNU 的 OpenAI Chat Completion 适配器创建请求专用副本，通过 `custom_extra_body` 传入参数；SDK 配置也独立复制，连接池仍归原 Provider 管理。保留其他模型配置、认证、代理、超时、重试和原始用量。不会临时改写共享 Provider、修改全局模型配置或给其他插件强加 JSON 输出。已有共享模型里的思考配置依然作用于其他调用；如需其他调用默认关闭，应另行移除共享配置中的思考覆盖项。
+
+不支持的适配器、错误的思考档位会产生审核异常，不会默默降级或自动通过。Schema 只约束格式，不保证审核结论正确；保留 JSON 校验和重试一次的兜底。返回截断、内容过滤、工具调用或拒答标记时，即使正文恰好是合法 JSON，也按无效审核输出处理并保留原始用量。插件不额外压低输出 token 上限，避免截断思考和最终 JSON。所有审核入口共用最多 3 个模型调用并发槽，等待槽位不计入模型耗时；其他插件的调用不在这个限额内。
+
+文档：[ECNU 结构化输出](https://developer.ecnu.edu.cn/vitepress/llm/api/structuredoutput.html)、[思考模式](https://developer.ecnu.edu.cn/vitepress/llm/thinking.html)。
+
 ## LLM 调用统计与缓存
 
 默认开启本插件的 LLM 调用统计，独立保存在 `data/plugin_data/astrbot_plugin_qq_group_auditor/llm_usage.sqlite3`。逐次记录调用时间、申请记录 ID、群号、Provider、实际模型、来源（实时审核/补审/测试）、尝试序号、输入/输出/缓存命中/未命中/思考 token、耗时和结果。开启此功能之前的历史调用无法补回用量。
