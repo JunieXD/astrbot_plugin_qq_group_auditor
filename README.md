@@ -165,8 +165,10 @@ LLM 输出格式必须是 JSON：
 当前聊天 provider 来自 DeepSeek 官方 API 时，插件会按照 [DeepSeek JSON Output 文档](https://api-docs.deepseek.com/guides/json_mode) 传入：
 
 ```json
-{"response_format": {"type": "json_object"}, "max_tokens": 512}
+{"response_format": {"type": "json_object"}}
 ```
+
+插件不额外设置输出 token 上限，遵循模型提供商及 AstrBot 的配置。
 
 审核提示词同时包含 `json` 关键字和目标格式示例。若模型仍返回空内容、无效 JSON 或错误字段结构，插件会追加格式纠正指令并重试一次。完整包裹返回内容的 `json` Markdown 代码块也可以解析；任意解释文字与 JSON 混合的响应仍会拒绝解析。
 

@@ -96,7 +96,6 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
 
 logger = logging.getLogger(__name__)
 
-_DEEPSEEK_JSON_MAX_TOKENS = 512
 _EXTERNAL_REJECTION_GRACE_SECONDS = 120
 _RECONCILE_INTERVAL_SECONDS = 60
 _JOIN_CONFIRM_RETRY_DELAYS = (60, 180, 600)
@@ -172,7 +171,6 @@ class AstrBotLLMClient:
             if _is_deepseek_provider_id(chat_provider_id):
                 generation_options = {
                     "response_format": {"type": "json_object"},
-                    "max_tokens": _DEEPSEEK_JSON_MAX_TOKENS,
                 }
             self.attempt += 1
             if self.statistics is not None:
@@ -411,7 +409,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.3.0")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.3.1")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)

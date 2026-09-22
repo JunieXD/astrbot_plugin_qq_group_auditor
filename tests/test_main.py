@@ -252,7 +252,7 @@ def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.3.0"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.3.1"
     assert [group.name for group in command_groups] == ["qgaudit"]
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
@@ -408,7 +408,7 @@ async def test_llm_client_falls_back_when_current_provider_lookup_raises(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_llm_client_enables_native_json_output_for_deepseek(monkeypatch):
+async def test_llm_client_enables_native_json_output_without_token_limit(monkeypatch):
     module, _ = import_main(monkeypatch)
     context = FakeContext(current_provider_id="deepseek/deepseek-v4-flash")
     client = module.AstrBotLLMClient(context, "umo-1")
@@ -422,7 +422,6 @@ async def test_llm_client_enables_native_json_output_for_deepseek(monkeypatch):
             "system_prompt": "system json",
             "prompt": "prompt",
             "response_format": {"type": "json_object"},
-            "max_tokens": 512,
         }
     ]
 
