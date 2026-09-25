@@ -17,17 +17,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .llm_usage import TOKEN_FIELDS, calculate_cost, extract_usage, field
+from .llm_usage import TOKEN_FIELDS, calculate_cost, extract_usage, field, usage_snapshot
 
 
-logger = logging.getLogger(__name__)
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 STATUS_LABELS = {"pending": "进行中", "returned": "已返回待校验", "success": "有效输出",
                  "invalid_json": "无效输出", "provider_error": "接口异常", "cancelled": "已取消",
                  "interrupted": "进程中断"}
 SUMMARY_COLUMNS = (
     "id", "review_id", "application_id", "group_id", "source", "attempt", "started_at",
     "provider_id", "model", "status", "duration_ms", *TOKEN_FIELDS,
-    "estimated_cost", "currency", "usage_source",
+    "estimated_cost", "cost_lower", "cost_upper", "currency", "usage_source",
 )
 
 
@@ -67,9 +70,13 @@ class UsageStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_group_time ON llm_calls(group_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_application ON llm_calls(application_id, group_id);
-                PRAGMA user_version=1;
             """)
             with self._db:
+                columns = {row["name"] for row in self._db.execute("PRAGMA table_info(llm_calls)")}
+                for name in ("raw_usage_json", "cost_lower", "cost_upper", "pricing_config"):
+                    if name not in columns:
+                        self._db.execute(f"ALTER TABLE llm_calls ADD COLUMN {name} TEXT")
+                self._db.execute("PRAGMA user_version=2")
                 # A process exit cannot tell us whether the provider billed a
                 # pending request. Preserve NULL counters and never retry here.
                 self._db.execute("UPDATE llm_calls SET status='interrupted' WHERE status='pending'")
@@ -125,6 +132,7 @@ class UsageStore:
         def write():
             self._prune()
             values = dict(metadata, started_at=time.time(),
+                          pricing_config=json.dumps(self.config["prices"], ensure_ascii=False),
                           system_prompt_hash=hashlib.sha256(system_prompt.encode()).hexdigest(),
                           prompt_hash=hashlib.sha256(prompt.encode()).hexdigest())
             if self.config["store_content"]:
@@ -152,14 +160,19 @@ class UsageStore:
             model = str(actual_model)[:256] if actual_model else record["model"]
             choices = field(raw, "choices", []) or []
             finish_reason = field(choices[0], "finish_reason") if isinstance(choices, (list, tuple)) and choices else None
-            cost = calculate_cost(usage, self.config["prices"], record["provider_id"], model)
+            prices = json.loads(record["pricing_config"]) if record["pricing_config"] else self.config["prices"]
+            cost = calculate_cost(usage, prices, record["provider_id"], model,
+                                  started_at=record["started_at"], configured_model=record["model"])
             values = dict(usage, **cost, status=status, duration_ms=max(0.0, duration_ms),
                           finished_at=time.time(), error_type=error_type[:128], model=model,
                           model_source="response" if actual_model else record["model_source"],
                           response_id=str(field(response, "id") or field(raw, "id") or "")[:256],
                           finish_reason=str(finish_reason)[:128] if finish_reason is not None else None)
             values["price_snapshot"] = json.dumps(cost["price_snapshot"], ensure_ascii=False) if cost["price_snapshot"] else None
-            if self.config["store_content"] and response is not None:
+            if self.config.get("store_usage", True):
+                snapshot = usage_snapshot(response)
+                values["raw_usage_json"] = json.dumps(snapshot, ensure_ascii=False) if snapshot is not None else None
+            if (self.config["store_content"] or self.config.get("store_response", False)) and response is not None:
                 text = str(field(response, "completion_text", "") or "")
                 maximum = self.config["content_max_chars"]
                 values.update(response_text=text[:maximum],
@@ -246,11 +259,20 @@ def summarize(rows: list[dict]) -> dict:
     cache_rows = [r for r in rows if r["input_tokens"] is not None and r["cached_tokens"] is not None]
     cache_inputs = sum(r["input_tokens"] for r in cache_rows)
     costs = defaultdict(Decimal)
+    bounds = defaultdict(lambda: [Decimal(0), Decimal(0)])
     priced = 0
+    bounded = 0
     for row in rows:
         if row["estimated_cost"] is not None:
             costs[row["currency"]] += Decimal(row["estimated_cost"])
             priced += 1
+        lower, upper = row.get("cost_lower"), row.get("cost_upper")
+        if lower is None and row["estimated_cost"] is not None:
+            lower = upper = row["estimated_cost"]
+        if lower is not None and upper is not None:
+            bounds[row["currency"]][0] += Decimal(lower)
+            bounds[row["currency"]][1] += Decimal(upper)
+            bounded += 1
     attempts = Counter(row["review_id"] for row in rows)
     return dict(count=len(rows), statuses=statuses, totals=totals, known=known,
                 reviews=len(attempts), retries=sum(row["attempt"] > 1 for row in rows),
@@ -258,7 +280,7 @@ def summarize(rows: list[dict]) -> dict:
                 cache_rate=sum(r["cached_tokens"] for r in cache_rows) / cache_inputs if cache_inputs else None,
                 average_ms=sum(durations) / len(durations) if durations else None,
                 p95_ms=durations[math.ceil(len(durations) * .95) - 1] if durations else None,
-                costs=dict(costs), priced=priced)
+                costs=dict(costs), priced=priced, cost_bounds=dict(bounds), bounded=bounded)
 
 
 def format_statistics(rows: list[dict], *, days: int, enabled: bool) -> str:
@@ -281,6 +303,9 @@ def format_statistics(rows: list[dict], *, days: int, enabled: bool) -> str:
              f"缓存命中率：{rate}（用量完整 {stats['cache_known']}/{count} 次）",
              f"调用平均 / P95 耗时：{latency}",
              f"已知估算费用：{costs}（已计价 {stats['priced']}/{count} 次）"]
+    if stats["bounded"] > stats["priced"]:
+        bounds = "；".join(f"{unit} {lo:.6f}–{hi:.6f}" for unit, (lo, hi) in sorted(stats["cost_bounds"].items()))
+        lines.append(f"含缓存未知调用的费用区间：{bounds}（覆盖 {stats['bounded']}/{count} 次，包含上述已计价调用）")
     lines.extend(f"模型 {provider} / {model or '未知'}：{n} 次" for (provider, model), n in models.most_common(10))
     if len(models) > 10:
         lines.append("其余模型请筛选查询或导出 CSV。")
@@ -300,6 +325,8 @@ def format_call_detail(rows: list[dict]) -> str:
         duration = f"{row['duration_ms']/1000:.2f}s" if row["duration_ms"] is not None else "未知"
         values = [str(row[k]) if row[k] is not None else "未知" for k in ("input_tokens", "output_tokens", "cached_tokens")]
         cost = f"{row['currency']} {row['estimated_cost']}" if row["estimated_cost"] is not None else "未知"
+        if row["estimated_cost"] is None and row.get("cost_lower") is not None:
+            cost = f"{row['currency']} {row['cost_lower']}–{row['cost_upper']}（缓存未知）"
         lines.append(f"#{row['id']} {row['source']} 第{row['attempt']}次 {row['status']} "
                      f"{row['model'] or '模型未知'}；输入/输出/命中={'/'.join(values)}；{duration}；费用={cost}")
     if len(rows) > 10:

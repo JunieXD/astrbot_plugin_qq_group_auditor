@@ -124,3 +124,54 @@ def test_statistics_config_handles_invalid_values_and_does_not_modify_input():
     assert config["prices"][0]["cached_input_per_million"] is None
     assert raw["prices"][2]["output_per_million"] == "Infinity"
     assert normalize_statistics({"prices": "bad"})["prices"] == []
+
+
+@pytest.mark.parametrize('stamp,multiplier', [
+    ('2026-09-25T07:59:59+08:00', 1), ('2026-09-25T08:00:00+08:00', 2),
+    ('2026-09-25T22:59:59+08:00', 2), ('2026-09-25T23:00:00+08:00', 1),
+    ('2026-09-26T12:00:00+08:00', 1), ('2026-09-27T12:00:00+08:00', 1),
+])
+def test_ecnu_peak_uses_beijing_request_start_and_does_not_mutate_price(stamp, multiplier):
+    from datetime import datetime
+    configured = prices(currency='CREDITS', schedule='ecnu_peak', cached_input_per_million='20',
+                        uncached_input_per_million='100', output_per_million='400')
+    data = dict(input_tokens=1000, cached_tokens=800, uncached_tokens=200, output_tokens=150)
+    cost = calculate_cost(data, configured, 'p', 'test-model', started_at=datetime.fromisoformat(stamp).timestamp())
+    assert Decimal(cost['estimated_cost']) == Decimal('.096') * multiplier
+    assert cost['cost_lower'] == cost['cost_upper'] == cost['estimated_cost']
+    assert cost['price_snapshot']['multiplier'] == multiplier
+    assert 'multiplier' not in configured[0]
+    assert cost['currency'] == 'CREDITS'
+
+
+def test_unknown_cache_yields_cost_bounds_but_missing_output_stays_unknown():
+    data = dict(input_tokens=1000, cached_tokens=None, uncached_tokens=None, output_tokens=150)
+    cost = calculate_cost(data, prices(), 'p', 'test-model')
+    assert cost['estimated_cost'] is None
+    assert Decimal(cost['cost_lower']) == Decimal('.0022')
+    assert Decimal(cost['cost_upper']) == Decimal('.0052')
+    data['output_tokens'] = None
+    cost = calculate_cost(data, prices(), 'p', 'test-model')
+    assert cost['cost_lower'] is cost['cost_upper'] is None
+
+
+def test_raw_usage_snapshot_is_allowlisted_and_preserves_missing_vs_zero():
+    from qq_group_auditor.llm_usage import usage_snapshot
+    raw = {'prompt_tokens': 100, 'completion_tokens': 0,
+           'prompt_tokens_details': {'cached_tokens': None, 'secret': 'credential'},
+           'api_key': 'credential', 'completion_tokens_details': {'reasoning_tokens': 0}}
+    snap = usage_snapshot(response(raw))
+    assert 'credential' not in str(snap)
+    assert snap['completion_tokens'] == 0
+    assert snap['prompt_tokens_details'] == {'cached_tokens': None}
+    assert 'total_tokens' not in snap
+    assert usage_snapshot(response(None)) is None
+    assert usage_snapshot(response({'prompt_tokens': float('nan')})) == {'prompt_tokens': 'invalid_number'}
+
+
+def test_ecnu_service_price_matches_configured_alias_despite_backend_model_change():
+    data = dict(cached_tokens=800, uncached_tokens=200, output_tokens=150)
+    configured = prices(match_model='configured', provider_id='ecnu/ecnu-plus')
+    cost = calculate_cost(data, configured, 'ecnu/ecnu-plus', 'qwen-backend', configured_model='test-model')
+    assert Decimal(cost['estimated_cost']) == Decimal('.0028')
+    assert calculate_cost(data, configured, 'other-provider', 'qwen-backend', configured_model='test-model')['estimated_cost'] is None

@@ -230,7 +230,7 @@
         "description": "模型单价（每百万 token）",
         "type": "template_list",
         "default": [],
-        "hint": "未配置价格仍记录用量，费用为未知。精确匹配实际模型名；相同模型优先匹配指定 Provider，重复配置使用第一条。支持人民币 CNY、美元 USD，币种分别汇总。",
+        "hint": "未配置价格时费用未知。指定 Provider 优先。支持 CNY、USD 和额度 CREDITS，分别汇总。缓存缺失但输入/输出总量已知时显示费用区间。",
         "templates": {
           "model_price": {
             "name": "模型计费价格",
@@ -242,12 +242,12 @@
                 "default": ""
               },
               "model": {
-                "description": "模型名称（精确匹配）",
+                "description": "计费模型名称（精确匹配）",
                 "type": "string",
                 "default": ""
               },
               "currency": {
-                "description": "币种（三位代码）",
+                "description": "计费单位（CNY / USD / CREDITS 等）",
                 "type": "string",
                 "default": "CNY"
               },
@@ -268,10 +268,42 @@
                 "type": "string",
                 "default": "",
                 "hint": "输出通常已包含思考 token，不重复计费。"
+              },
+              "schedule": {
+                "description": "计费时段",
+                "type": "string",
+                "default": "flat",
+                "options": [
+                  "flat",
+                  "ecnu_peak"
+                ],
+                "hint": "flat 为固定价格；ecnu_peak 填谷时单价，按请求开始的北京时间，周一至周五 08:00–23:00 乘 2。价格与倍率随调用保存。"
+              },
+              "match_model": {
+                "description": "价格匹配模型名来源",
+                "type": "string",
+                "default": "response",
+                "options": [
+                  "response",
+                  "configured"
+                ],
+                "hint": "response 按返回的实际模型名（缺失时用配置名）；configured 按调用开始时配置的模型名。ECNU 按对外服务名 ecnu-plus/ecnu-max 计费，请选择 configured。"
               }
             }
           }
         }
+      },
+      "store_response": {
+        "description": "单独保存模型最终输出",
+        "type": "bool",
+        "default": false,
+        "hint": "无需保存输入提示词即可记录输出 JSON；不保存思考正文。store_content 开启时也会保存输出。"
+      },
+      "store_usage": {
+        "description": "保存精简的原始 usage 字段",
+        "type": "bool",
+        "default": true,
+        "hint": "仅保留白名单 token 计数，用于排查缓存缺失；不包含请求头、密钥和模型正文。"
       }
     }
   },

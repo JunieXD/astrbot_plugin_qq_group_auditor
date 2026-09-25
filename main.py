@@ -96,7 +96,10 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
     from qq_group_auditor.llm_options import normalize_llm_review, ecnu_request_provider, review_completion_text
 
 
-logger = logging.getLogger(__name__)
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 _EXTERNAL_REJECTION_GRACE_SECONDS = 120
 _RECONCILE_INTERVAL_SECONDS = 60
@@ -150,7 +153,8 @@ class AstrBotLLMClient:
                  statistics: UsageStore | None = None, tasks: set | None = None,
                  application_id: int | None = None, platform_id: str = "",
                  group_id: str = "", source: str = "test",
-                 llm_options: dict | None = None, limiter: asyncio.Semaphore | None = None) -> None:
+                 llm_options: dict | None = None, limiter: asyncio.Semaphore | None = None,
+                 observer=None) -> None:
         self.context = context
         self.umo = umo
         self.statistics = statistics
@@ -161,6 +165,12 @@ class AstrBotLLMClient:
         self.last_call_id: int | None = None
         self.options = normalize_llm_review(llm_options)
         self.limiter = limiter
+        self.observer = observer
+
+    def _emit(self, phase, **details):
+        if self.observer is not None:
+            with contextlib.suppress(Exception):
+                self.observer(phase, **details)
 
     async def generate(self, *, system_prompt: str, prompt: str) -> str:
         task = asyncio.current_task()
@@ -173,9 +183,13 @@ class AstrBotLLMClient:
         acquired = False
         try:
             chat_provider_id = await self._provider_id()
+            queued_at = time.perf_counter()
+            self._emit("llm_queued", attempt=self.attempt + 1)
             if self.limiter is not None:
                 await self.limiter.acquire()
                 acquired = True
+            self._emit("llm_start", attempt=self.attempt + 1,
+                       queue_ms=(time.perf_counter() - queued_at) * 1000)
             generation_options: dict[str, Any] = {}
             if _is_deepseek_provider_id(chat_provider_id):
                 generation_options = {
@@ -213,6 +227,8 @@ class AstrBotLLMClient:
             error_type = type(exc).__name__
             raise
         finally:
+            self._emit("llm_end", status=status, error_type=error_type,
+                       duration_ms=(time.perf_counter() - started) * 1000 if started is not None else None)
             if acquired:
                 self.limiter.release()
             if self.statistics is not None and started is not None:
@@ -223,6 +239,7 @@ class AstrBotLLMClient:
                 self.tasks.discard(task)
 
     def response_parsed(self, status: str) -> None:
+        self._emit("llm_parsed", status=status)
         if self.statistics is not None:
             self.statistics.parsed(self.last_call_id, status)
 
@@ -429,7 +446,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.4.0")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.4.1")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -466,6 +483,10 @@ class QQGroupAuditorPlugin(Star):
             self.usage_store = None
 
     async def initialize(self) -> None:
+        logger.info("加群审核诊断已启用：阶段记录=%s，保存最终输出=%s，保存 usage=%s",
+                    self.audit_store is not None,
+                    self.config["llm_statistics"]["store_content"] or self.config["llm_statistics"]["store_response"],
+                    self.config["llm_statistics"]["store_usage"])
         if self.audit_store is not None and self._reconcile_task is None:
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
@@ -502,7 +523,7 @@ class QQGroupAuditorPlugin(Star):
             self.usage_store = None
 
     async def _run_guarded(self, platform_id, action, *, delay, gap=None, key=None,
-                           dedup_seconds=604800, priority=1, group=None, label="自动操作"):
+                           dedup_seconds=604800, priority=1, group=None, label="自动操作", observer=None):
         if self._stopped:
             raise ActionDeferred("插件正在重载")
         pacing = self.config["automation_pacing"]
@@ -522,7 +543,7 @@ class QQGroupAuditorPlugin(Star):
                 action=checked_action, config=pacing, delay=delay,
                 gap=spacing, key=key,
                 dedup_seconds=dedup_seconds,
-                priority=priority, group=group, label=label,
+                priority=priority, group=group, label=label, observer=observer,
             )
         except self.guard.deferred_error as exc:
             logger.info("QQ 操作暂缓或跳过：账号=%s，任务=%s，群=%s，原因=%s",
@@ -810,6 +831,17 @@ class QQGroupAuditorPlugin(Star):
                 action_source=action_source,
             )
 
+    def _trace_application(self, application_id, phase, **details):
+        logger.info("加群审核阶段：申请=%s，阶段=%s，数据=%s", application_id, phase, details)
+        if application_id is None or self.audit_store is None:
+            return
+        try:
+            self.audit_store.record_phase(application_id, phase, details)
+        except Exception as exc:
+            if time.monotonic() >= getattr(self, "_trace_warn_after", 0):
+                logger.warning("审核阶段记录失败，审核继续：%s", type(exc).__name__)
+                self._trace_warn_after = time.monotonic() + 60
+
     async def _run_application_review(
         self,
         *,
@@ -820,6 +852,10 @@ class QQGroupAuditorPlugin(Star):
         unified_msg_origin: str | None,
         action_source: str,
     ) -> ActionResult:
+        started = time.perf_counter()
+        def observe(phase, **details):
+            self._trace_application(application_id, phase, **details)
+        observe("review_start", source=action_source, request_kind=request.request_kind)
         action_delay_seconds = (
             _catch_up_action_delay_seconds()
             if action_source == "plugin_catch_up"
@@ -829,7 +865,7 @@ class QQGroupAuditorPlugin(Star):
             RuntimeReviewer(self.context, unified_msg_origin, statistics=self.usage_store,
                             llm_options=self.config["llm_review"], limiter=self._llm_limiter,
                             tasks=self._llm_tasks, application_id=application_id,
-                            platform_id=platform_id, source=action_source),
+                            platform_id=platform_id, source=action_source, observer=observe),
             RuntimePlatform(
                 self.context,
                 platform_id=platform_id,
@@ -841,6 +877,7 @@ class QQGroupAuditorPlugin(Star):
                     key=f"review:{req.group_id}:{req.applicant_qq}:{req.flag}",
                     priority=0, group=req.group_id,
                     label=f"{'邀请' if req.request_kind == 'invite' else '申请'}审批 #{application_id}",
+                    observer=observe,
                 ),
             ),
             RuntimeNotifier(
@@ -850,7 +887,14 @@ class QQGroupAuditorPlugin(Star):
             logger=logger,
             check_request=lambda: self._check_review_request(request, application_id),
         )
-        result = await service.handle_request(group_config, request)
+        try:
+            result = await service.handle_request(group_config, request)
+        except BaseException as exc:
+            observe("review_end", status="interrupted", error_type=type(exc).__name__,
+                    duration_ms=(time.perf_counter() - started) * 1000)
+            raise
+        observe("review_end", status=result.action,
+                duration_ms=(time.perf_counter() - started) * 1000)
         if application_id is None:
             return result
         try:

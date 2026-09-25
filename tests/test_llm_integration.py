@@ -159,3 +159,44 @@ async def test_stats_invalid_queries_return_readable_error(monkeypatch, command)
     messages = await collect(plugin.qgaudit_stats(FakeEvent(message=command)))
     assert "用法" in messages[0] or "天数" in messages[0]
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_review_timeline_persists_model_queue_platform_and_total(monkeypatch, tmp_path):
+    from qq_group_auditor.pacing import ActionGuard
+    module, _ = import_main(monkeypatch)
+    config = plugin_config()
+    config['automation_pacing'] = {'review_min_seconds': 0, 'review_max_seconds': 0,
+                                   'action_gap_min_seconds': 0, 'action_gap_max_seconds': 0}
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
+    plugin.guard = ActionGuard(tmp_path / 'guard.json')
+    async def approve(*args, **kwargs):
+        pass
+    monkeypatch.setattr(module, 'set_group_request', approve)
+    await plugin.handle_group_request(FakeRequestEvent())
+    app = plugin.audit_store.history(group_id='123', applicant_qq='20002')[0]
+    record = plugin.audit_store.detail(group_id='123', application_id=app['id'])
+    stages = [r['phase'] for r in record['phases']]
+    assert stages[0] == 'review_start' and stages[-1] == 'review_end'
+    assert stages.index('llm_end') < stages.index('action_queued') < stages.index('platform_end')
+    assert 'llm_parsed' in stages and 'online_check_end' in stages
+    assert plugin.audit_store.detail(group_id='other-group', application_id=app['id']) is None
+    text = module.format_detail(record)
+    assert '阶段记录' in text and '模型返回' in text and '平台操作结束' in text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_timeline_write_failure_keeps_review_and_approval(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    calls = []
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError('locked')
+    async def approve(*args, **kwargs):
+        calls.append(kwargs)
+    monkeypatch.setattr(plugin.audit_store, 'record_phase', broken)
+    monkeypatch.setattr(module, 'set_group_request', approve)
+    await plugin.handle_group_request(FakeRequestEvent())
+    assert calls[0]['approve'] is True
+    await plugin.terminate()

@@ -8,7 +8,10 @@ from typing import Callable, Protocol
 from .models import ReviewDecision
 
 
-logger = logging.getLogger(__name__)
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 MAX_REVIEW_ATTEMPTS = 2
 RESPONSE_LOG_LIMIT = 500

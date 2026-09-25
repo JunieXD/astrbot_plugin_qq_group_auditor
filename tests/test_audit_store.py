@@ -273,7 +273,7 @@ def test_existing_database_migrates_request_kind_without_losing_rows(tmp_path):
     connection.close()
 
     assert request_kind == "application"
-    assert user_version == 4
+    assert user_version == 5
 
 
 def test_external_checked_without_join_is_inferred_as_reject(tmp_path):

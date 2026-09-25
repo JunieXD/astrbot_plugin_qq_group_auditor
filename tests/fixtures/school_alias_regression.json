@@ -1,0 +1,72 @@
+[
+  {
+    "answer": "24-SDUT",
+    "approve": true,
+    "school": "山东理工大学"
+  },
+  {
+    "answer": "3-sdut",
+    "approve": true,
+    "school": "山东理工大学"
+  },
+  {
+    "answer": "24-SDUST",
+    "approve": true,
+    "school": "山东科技大学"
+  },
+  {
+    "answer": "23-hbut",
+    "approve": true,
+    "school": "湖北工业大学"
+  },
+  {
+    "answer": "24-HEBUT",
+    "approve": false,
+    "school": "河北工业大学"
+  },
+  {
+    "answer": "24-SWUFE",
+    "approve": false,
+    "school": "西南财经大学"
+  },
+  {
+    "answer": "24-SYSU",
+    "approve": false,
+    "school": "中山大学"
+  },
+  {
+    "answer": "24-WUT",
+    "approve": false,
+    "school": "武汉理工大学"
+  },
+  {
+    "answer": "2023级西南石油大学",
+    "approve": false,
+    "school": "西南石油大学"
+  },
+  {
+    "answer": "23-neau",
+    "approve": false,
+    "school": "东北农业大学"
+  },
+  {
+    "answer": "23级-南京林业大学",
+    "approve": false,
+    "school": "南京林业大学"
+  },
+  {
+    "answer": "24-jxnu（江西财经大学）",
+    "approve": false,
+    "school": ""
+  },
+  {
+    "answer": "计算机",
+    "approve": false,
+    "school": ""
+  },
+  {
+    "answer": "23-hnust",
+    "approve": true,
+    "school": "湖南科技大学"
+  }
+]

@@ -1,7 +1,7 @@
 """Shared, durable pacing for the two QQ automation plugins.
 
-Keep this module identical in qq_group_auditor and github_subscriber. The registry
-on AstrBot's shared platform manager survives individual plugin reloads.
+The registry on AstrBot's shared platform manager survives individual plugin
+reloads. New arguments must remain optional for the github_subscriber caller.
 """
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ import random
 import time
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+try:
+    from astrbot.api import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 _PRIORITY_AGING_SECONDS = 60
 
 
@@ -63,13 +66,14 @@ def get_guard(context, data_root):
         deferred_error = guard.deferred_error
         guard.__class__ = ActionGuard
         guard.deferred_error = deferred_error
-        guard._init_scheduler()
+        if not hasattr(guard, "_pending"):
+            guard._init_scheduler()
     return guard
 
 
 class ActionGuard:
     deferred_error = ActionDeferred
-    scheduling_version = 3
+    scheduling_version = 4
 
     def __init__(self, path):
         self.path = Path(path)
@@ -112,7 +116,13 @@ class ActionGuard:
 
     async def run(self, *, account, online, action, config, delay=(0, 0),
                   gap=(8, 15), key=None, dedup_seconds=604800,
-                  priority=1, group=None, label="自动操作"):
+                  priority=1, group=None, label="自动操作", observer=None):
+        def emit(phase, **details):
+            if observer is not None:
+                try:
+                    observer(phase, **details)
+                except Exception as exc:
+                    logger.warning("QQ 操作阶段记录失败：%s", type(exc).__name__)
         enqueued_at = time.time()
         ready_at = enqueued_at + random.uniform(*delay)
         self._sequence += 1
@@ -124,17 +134,22 @@ class ActionGuard:
                     account, label, group or "其他", ready_at - enqueued_at,
                     time.strftime("%H:%M:%S", time.localtime(ready_at)))
         try:
+            emit("action_queued", delay_seconds=ready_at - enqueued_at)
             return await self._run_ticket(
                 ticket=ticket, enqueued_at=enqueued_at, label=label, account=account,
                 online=online, action=action, config=config, gap=gap,
-                key=key, dedup_seconds=dedup_seconds,
+                key=key, dedup_seconds=dedup_seconds, emit=emit,
             )
+        except BaseException as exc:
+            emit("action_stopped", error_type=type(exc).__name__)
+            raise
         finally:
             self._pending[account].remove(ticket)
             self._wake_queue(account)
 
     async def _run_ticket(self, *, ticket, enqueued_at, label, account, online,
-                          action, config, gap, key, dedup_seconds):
+                          action, config, gap, key, dedup_seconds, emit=None):
+        emit = emit or (lambda *args, **kwargs: None)
         ready_at = ticket["ready_at"]
         lock = self.locks.setdefault(account, asyncio.Lock())
         state = self.accounts.setdefault(account, {})
@@ -148,6 +163,7 @@ class ActionGuard:
                     del records[old_key]
             if fingerprint in records:
                 if records[fingerprint]["status"] == "success":
+                    emit("action_deduplicated")
                     return True
                 raise ActionUncertain("此前操作结果不明，需核对状态后人工处理")
             if now < state.get("paused_until", 0):
@@ -155,10 +171,14 @@ class ActionGuard:
             return False
 
         async def check_online():
+            started = time.perf_counter()
+            emit("online_check_start")
             try:
                 connected = await online()
             except Exception:
                 connected = False
+            emit("online_check_end", duration_ms=(time.perf_counter() - started) * 1000,
+                 connected=bool(connected))
             if not connected:
                 state["was_offline"] = True
                 state["paused_until"] = time.time() + 300
@@ -179,6 +199,7 @@ class ActionGuard:
         def waiting(reason):
             nonlocal last_wait_reason
             if reason != last_wait_reason:
+                emit("action_wait", reason=reason)
                 logger.info("QQ 操作等待：账号=%s，任务=%s，群=%s，原因=%s",
                             account, label, ticket["group"], reason)
                 last_wait_reason = reason
@@ -221,19 +242,26 @@ class ActionGuard:
                     logger.info("QQ 操作开始：账号=%s，任务=%s，群=%s，累计等待=%.1f 秒",
                                 account, label, ticket["group"], time.time() - enqueued_at)
                     try:
+                        started = time.perf_counter()
+                        emit("platform_start", queue_ms=(time.time() - enqueued_at) * 1000)
                         result = await action()
                     except self.deferred_error:
+                        emit("platform_skipped", duration_ms=(time.perf_counter() - started) * 1000)
                         if fingerprint:
                             records.pop(fingerprint, None)
                         self._save()
                         raise
-                    except BaseException:
+                    except BaseException as exc:
+                        emit("platform_end", duration_ms=(time.perf_counter() - started) * 1000,
+                             status="uncertain", error_type=type(exc).__name__)
                         state["failures"] = state.get("failures", 0) + 1
                         if state["failures"] >= config["failure_threshold"]:
                             state["paused_until"] = time.time() + config["failure_cooldown_seconds"]
                         self._save()
                         raise
                     else:
+                        emit("platform_end", duration_ms=(time.perf_counter() - started) * 1000,
+                             status="succeeded")
                         state["failures"] = 0
                         if fingerprint:
                             records[fingerprint]["status"] = "success"

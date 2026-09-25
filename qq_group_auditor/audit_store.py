@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -78,6 +79,16 @@ class AuditStore:
             observed_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS application_phases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+            phase TEXT NOT NULL,
+            occurred_at REAL NOT NULL,
+            details TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_phases_application
+            ON application_phases(application_id, id);
+
         CREATE TABLE IF NOT EXISTS membership_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             join_event_key TEXT UNIQUE,
@@ -148,7 +159,14 @@ class AuditStore:
                     "ALTER TABLE applications ADD COLUMN "
                     "request_flag TEXT NOT NULL DEFAULT ''"
                 )
-            self._connection.execute("PRAGMA user_version = 4")
+            self._connection.execute("PRAGMA user_version = 5")
+
+    def record_phase(self, application_id: int, phase: str, details: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO application_phases(application_id, phase, occurred_at, details) VALUES(?,?,?,?)",
+                (application_id, phase, time.time(), json.dumps(details, ensure_ascii=False)),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -1266,7 +1284,14 @@ class AuditStore:
                 "SELECT * FROM applications WHERE group_id = ? AND id = ?",
                 (group_id, application_id),
             ).fetchone()
-            return self._application_detail(row) if row else None
+            if row is None:
+                return None
+            record = self._application_detail(row)
+            record["phases"] = [dict(item) for item in self._connection.execute(
+                "SELECT * FROM application_phases WHERE application_id=? ORDER BY id DESC LIMIT 100",
+                (row["id"],),
+            )][::-1]
+            return record
 
     def _application_detail(self, row: sqlite3.Row) -> dict[str, Any]:
         application = dict(row)

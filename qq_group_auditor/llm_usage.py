@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -10,6 +11,7 @@ TOKEN_FIELDS = ("input_tokens", "cached_tokens", "uncached_tokens", "output_toke
 PRICE_FIELDS = ("cached_input_per_million", "uncached_input_per_million", "output_per_million")
 DEFAULT_STATISTICS = {
     "enabled": True, "store_content": False, "content_max_chars": 20000,
+    "store_response": False, "store_usage": True,
     "retention_days": 90, "prices": [],
 }
 
@@ -41,7 +43,7 @@ def decimal_price(value: Any) -> Decimal | None:
 def normalize_statistics(value: Any) -> dict:
     raw = value if isinstance(value, dict) else {}
     config = dict(DEFAULT_STATISTICS)
-    for key in ("enabled", "store_content"):
+    for key in ("enabled", "store_content", "store_response", "store_usage"):
         v = raw.get(key, config[key])
         config[key] = v if isinstance(v, bool) else str(v).lower() in {"1", "true", "yes", "on"}
     for key, minimum, maximum in (("retention_days", 0, 3650), ("content_max_chars", 256, 200000)):
@@ -59,8 +61,12 @@ def normalize_statistics(value: Any) -> dict:
         row = {"model": str(item["model"]).strip(),
                "provider_id": str(item.get("provider_id") or "").strip(),
                "currency": str(item.get("currency") or "CNY").strip().upper()}
-        if not row["currency"].isascii() or not row["currency"].isalpha() or len(row["currency"]) != 3:
+        if row["currency"] != "CREDITS" and (
+            not row["currency"].isascii() or not row["currency"].isalpha() or len(row["currency"]) != 3
+        ):
             continue
+        row["schedule"] = "ecnu_peak" if item.get("schedule") == "ecnu_peak" else "flat"
+        row["match_model"] = "configured" if item.get("match_model") == "configured" else "response"
         for key in PRICE_FIELDS:
             price = decimal_price(item.get(key))
             row[key] = str(price) if price is not None else None
@@ -124,16 +130,67 @@ def extract_usage(response: Any) -> dict:
     return result
 
 
-def calculate_cost(usage: dict, prices: list[dict], provider_id: str, model: str) -> dict:
-    candidates = [p for p in prices if p["model"] == model and p["provider_id"] in ("", provider_id)]
+def usage_snapshot(response: Any) -> dict | None:
+    """Only retain known usage fields, never arbitrary provider metadata or text."""
+    raw = field(field(response, "raw_completion"), "usage")
+    if raw is None:
+        return None
+    def scalar(value):
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value if abs(value) <= 2**63 - 1 else "invalid_number"
+        if isinstance(value, float):
+            return value if math.isfinite(value) and abs(value) <= 2**63 - 1 else "invalid_number"
+        return "invalid_type"
+    result = {}
+    absent = object()
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens",
+                 "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+        value = field(raw, name, absent)
+        if value is not absent:
+            result[name] = scalar(value)
+    for name, keys in (("prompt_tokens_details", ("cached_tokens", "audio_tokens")),
+                       ("completion_tokens_details", ("reasoning_tokens", "audio_tokens",
+                                                       "accepted_prediction_tokens", "rejected_prediction_tokens"))):
+        value = field(raw, name, absent)
+        if value is absent:
+            continue
+        result[name] = None if value is None else {
+            key: scalar(field(value, key)) for key in keys if field(value, key, absent) is not absent
+        }
+    return result
+
+
+def calculate_cost(usage: dict, prices: list[dict], provider_id: str, model: str,
+                   *, started_at: float | None = None, configured_model: str | None = None) -> dict:
+    candidates = [p for p in prices if p["model"] == (
+        configured_model if p.get("match_model") == "configured" else model
+    ) and p["provider_id"] in ("", provider_id)]
     candidates.sort(key=lambda p: p["provider_id"] != provider_id)
-    price = candidates[0] if candidates else None
+    price = dict(candidates[0]) if candidates else None
     result = {"estimated_cost": None, "currency": price["currency"] if price else "",
-              "price_snapshot": price}
+              "price_snapshot": price, "cost_lower": None, "cost_upper": None}
     if price is None:
         return result
+    multiplier = 1
+    if price.get("schedule") == "ecnu_peak":
+        if started_at is None:
+            return result
+        local = datetime.fromtimestamp(started_at, timezone(timedelta(hours=8)))
+        multiplier = 2 if local.weekday() < 5 and 8 <= local.hour < 23 else 1
+        price.update(multiplier=multiplier, priced_at=local.isoformat(), timezone="UTC+08:00")
     cached, other, output = (usage.get(k) for k in ("cached_tokens", "uncached_tokens", "output_tokens"))
-    hit_rate, miss_rate, output_rate = (decimal_price(price.get(k)) for k in PRICE_FIELDS)
+    hit_rate, miss_rate, output_rate = (
+        None if decimal_price(price.get(k)) is None else decimal_price(price[k]) * multiplier
+        for k in PRICE_FIELDS
+    )
+    # Unknown cache split is a range, never an invented point estimate.
+    if (cached is None or other is None) and usage.get("input_tokens") is not None and output is not None:
+        if all(rate is not None for rate in (hit_rate, miss_rate, output_rate)):
+            total_input = usage["input_tokens"]
+            result["cost_lower"] = str((total_input * min(hit_rate, miss_rate) + output * output_rate) / Decimal(1000000))
+            result["cost_upper"] = str((total_input * max(hit_rate, miss_rate) + output * output_rate) / Decimal(1000000))
     # A missing cache split can still be priced when both input rates match.
     if (cached is None or other is None) and usage.get("input_tokens") is not None and hit_rate == miss_rate and hit_rate is not None:
         cached, other = 0, usage["input_tokens"]
@@ -144,4 +201,5 @@ def calculate_cost(usage: dict, prices: list[dict], provider_id: str, model: str
         if count and rate is not None:
             total += count * rate / Decimal(1000000)
     result["estimated_cost"] = str(total)
+    result["cost_lower"] = result["cost_upper"] = str(total)
     return result

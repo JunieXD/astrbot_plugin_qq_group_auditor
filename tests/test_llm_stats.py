@@ -179,3 +179,68 @@ def test_report_reader_does_not_block_live_writes(tmp_path):
     with path.open(encoding="utf-8-sig") as f:
         assert len(list(csv.DictReader(f))) == 2
     store.close()
+
+
+def test_response_only_recording_keeps_inputs_private_and_usage_available():
+    store = UsageStore(':memory:', store_config(store_response=True))
+    call = begin(store, prompt='private-input')
+    store.finish(call, status='returned', duration_ms=2, response=response())
+    row = store.query(group_ids=['123'], content=True)[0]
+    assert row['system_prompt_text'] is row['prompt_text'] is None
+    assert row['response_text'] == '{"approve":true,"reason":"OK"}'
+    assert json.loads(row['raw_usage_json'])['prompt_tokens_details']['cached_tokens'] == 80
+    assert 'private-input' not in str(row)
+    store.close()
+
+
+def test_usage_recording_can_be_disabled_without_losing_counters():
+    store = UsageStore(':memory:', store_config(store_usage=False))
+    call = begin(store)
+    store.finish(call, status='returned', duration_ms=2, response=response())
+    row = store.query(group_ids=['123'], content=True)[0]
+    assert row['raw_usage_json'] is None and row['cached_tokens'] == 80
+    store.close()
+
+
+def test_inflight_call_keeps_price_configuration_from_start():
+    store = UsageStore(':memory:', store_config())
+    call = begin(store)
+    store.config['prices'][0]['output_per_million'] = '999'
+    store.finish(call, status='returned', duration_ms=2, response=response())
+    row = store.query(group_ids=['123'], content=True)[0]
+    assert Decimal(row['estimated_cost']) == Decimal('.00032')
+    assert json.loads(row['price_snapshot'])['output_per_million'] == '8'
+    store.close()
+
+
+def test_missing_cache_cost_interval_is_visible_and_not_counted_as_exact():
+    store = UsageStore(':memory:', store_config())
+    call = begin(store)
+    store.finish(call, status='returned', duration_ms=2,
+                 response=response({'prompt_tokens': 100, 'completion_tokens': 20}))
+    rows = store.query(group_ids=['123'])
+    stats = summarize(rows)
+    assert stats['priced'] == 0 and stats['bounded'] == 1
+    assert '费用区间' in format_statistics(rows, days=7, enabled=True)
+    assert rows[0]['estimated_cost'] is None
+    store.close()
+
+
+def test_v1_database_migrates_without_rewriting_old_calls(tmp_path):
+    path = tmp_path / 'old.db'
+    store = UsageStore(path, store_config())
+    call = begin(store)
+    store.finish(call, status='returned', duration_ms=2, response=response())
+    store.close()
+    db = sqlite3.connect(path)
+    for name in ('raw_usage_json', 'cost_lower', 'cost_upper', 'pricing_config'):
+        db.execute(f'ALTER TABLE llm_calls DROP COLUMN {name}')
+    db.execute('PRAGMA user_version=1')
+    db.commit()
+    db.close()
+    migrated = UsageStore(path, store_config())
+    row = migrated.query(group_ids=['123'], content=True)[0]
+    assert row['estimated_cost'] is not None and row['cost_lower'] is None
+    assert summarize([row])['bounded'] == 1
+    assert migrated._db.execute('PRAGMA user_version').fetchone()[0] == 2
+    migrated.close()

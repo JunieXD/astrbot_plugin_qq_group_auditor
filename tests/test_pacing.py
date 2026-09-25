@@ -359,7 +359,7 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
     assert upgraded is legacy
     assert upgraded.locks is locks and upgraded.accounts is accounts
     assert upgraded.deferred_error is old_error
-    assert upgraded.scheduling_version == 3
+    assert upgraded.scheduling_version == 4
     calls = []
 
     async def action():
@@ -491,3 +491,53 @@ async def test_queue_logs_explain_delay_and_start_without_leaking_keys(runtime, 
     assert "累计等待=15.0 秒" in caplog.text
     assert "邀请审批 #42" in caplog.text
     assert "private-content" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stage_observer_tracks_wait_and_platform_latency_without_key(runtime):
+    guard, now, _ = runtime
+    events = []
+    async def action():
+        await asyncio.sleep(3)
+    await guard.run(**options(action, key='sensitive-flag',
+                             observer=lambda phase, **details: events.append((phase, details))))
+    phases = [p for p, _ in events]
+    assert phases[0] == 'action_queued'
+    assert 'action_wait' in phases and phases.index('platform_start') < phases.index('platform_end')
+    assert dict(events)['platform_start']['queue_ms'] == 15000
+    assert dict(events)['platform_end']['status'] == 'succeeded'
+    assert 'sensitive-flag' not in str(events)
+
+
+@pytest.mark.asyncio
+async def test_observer_failure_does_not_prevent_approval(runtime):
+    guard, _, _ = runtime
+    calls = []
+    async def action():
+        calls.append(True)
+    def broken(*args, **kwargs):
+        raise OSError('failure')
+    await guard.run(**options(action, observer=broken))
+    assert calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_upgrade_v3_preserves_live_queue_and_wakes_existing_waiters(manual_runtime):
+    guard, clock = manual_runtime
+    class V3Guard(pacing.ActionGuard):
+        scheduling_version = 3
+    old = V3Guard(guard.path)
+    calls = []
+    async def action():
+        calls.append(clock.now)
+    task = asyncio.create_task(old.run(account='bot', online=online, action=action,
+        config=CONFIG, delay=(5, 5), key='pending'))
+    await clock.settle()
+    pending, changed = old._pending, old._changed
+    manager = SimpleNamespace(_qq_automation_guard_v1=old)
+    upgraded = pacing.get_guard(SimpleNamespace(platform_manager=manager), guard.path.parent)
+    assert upgraded is old and upgraded._pending is pending and upgraded._changed is changed
+    assert len(upgraded._pending['bot']) == 1
+    await clock.advance(5)
+    await task
+    assert calls == [1005] and upgraded._pending['bot'] == []
