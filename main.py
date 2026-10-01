@@ -143,11 +143,6 @@ def _system_request_is_checked(item: dict[str, Any]) -> bool:
     return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
 
 
-@filter.command_group("qgaudit")
-def qgaudit():
-    pass
-
-
 class AstrBotLLMClient:
     def __init__(self, context: Context, umo: str | None = None, *,
                  statistics: UsageStore | None = None, tasks: set | None = None,
@@ -1908,9 +1903,45 @@ class QQGroupAuditorPlugin(Star):
             )
         return True
 
+    def _command_allowed(self, event: Any, group_id: str | None = None) -> bool:
+        sender = _sender_id(event)
+        if group_id is not None:
+            return is_group_admin(self.config, group_id, sender)
+        return any(is_group_admin(self.config, group["group_id"], sender)
+                   for group in self.config["group_audits"])
+
+    @filter.command("qgaudit")
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("test")
+    async def qgaudit_command(self, event: Any) -> None:
+        # No typed framework parameters or command group: authorize before any
+        # help/argument error can be generated. Stop only this matched command.
+        event.stop_event()
+        if not self._command_allowed(event):
+            return
+        parts = _event_message_text(event).strip().split()
+        handlers = {
+            "test": self.qgaudit_test, "backfill": self.qgaudit_backfill,
+            "history": self.qgaudit_history, "detail": self.qgaudit_detail,
+            "stats": self.qgaudit_stats, "export": self.qgaudit_export,
+        }
+        handler = handlers.get(parts[1]) if len(parts) > 1 else None
+        if handler is None:
+            yield event.plain_result(
+                "QQ 入群审核（请私聊使用）\n"
+                "/qgaudit test <群号> <申请答案>\n"
+                "/qgaudit backfill <群号>\n"
+                "/qgaudit history <群号> <QQ号> [条数]\n"
+                "/qgaudit detail <群号> <记录ID>\n"
+                "/qgaudit stats [7d] [群号|all] [模型名]\n"
+                "/qgaudit export [7d] [群号|all] [模型名]"
+            )
+            return
+        async for result in handler(event):
+            yield result
+
     async def qgaudit_test(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         parsed = parse_test_command(_event_message_text(event))
         if parsed is None:
             yield event.plain_result("用法：/qgaudit test <群号> <申请答案>")
@@ -1918,7 +1949,6 @@ class QQGroupAuditorPlugin(Star):
 
         group_id, answer = parsed
         if not is_group_admin(self.config, group_id, _sender_id(event)):
-            yield event.plain_result("无权限")
             return
 
         group_config = find_group_config(self.config, group_id)
@@ -1950,15 +1980,14 @@ class QQGroupAuditorPlugin(Star):
 
         yield event.plain_result(f"approve={decision.approve} reason={decision.reason}")
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("backfill")
     async def qgaudit_backfill(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         group_id = parse_backfill_command(_event_message_text(event))
         if group_id is None:
             yield event.plain_result("用法：/qgaudit backfill <群号>")
             return
         if not is_group_admin(self.config, group_id, _sender_id(event)):
-            yield event.plain_result("无权限")
             return
         group_config = find_group_config(self.config, group_id)
         if group_config is None:
@@ -2000,16 +2029,15 @@ class QQGroupAuditorPlugin(Star):
             f"无可用的通过记录：{counts['unmatched']}"
         )
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("history")
     async def qgaudit_history(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         parsed = parse_history_command(_event_message_text(event))
         if parsed is None:
             yield event.plain_result("用法：/qgaudit history <群号> <QQ号> [条数]")
             return
         group_id, applicant_qq, limit = parsed
         if not is_group_admin(self.config, group_id, _sender_id(event)):
-            yield event.plain_result("无权限")
             return
         if self.audit_store is None:
             yield event.plain_result("审计数据库不可用")
@@ -2030,16 +2058,15 @@ class QQGroupAuditorPlugin(Star):
             return
         yield event.plain_result(format_history(records))
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("detail")
     async def qgaudit_detail(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         parsed = parse_detail_command(_event_message_text(event))
         if parsed is None:
             yield event.plain_result("用法：/qgaudit detail <群号> <记录ID>")
             return
         group_id, application_id = parsed
         if not is_group_admin(self.config, group_id, _sender_id(event)):
-            yield event.plain_result("无权限")
             return
         if self.audit_store is None:
             yield event.plain_result("审计数据库不可用")
@@ -2079,19 +2106,21 @@ class QQGroupAuditorPlugin(Star):
         if requested != "all":
             groups = [requested] if requested in groups else []
         if not groups:
-            raise ValueError("无权限")
+            raise PermissionError("无权限")
         if self.usage_store is None:
             raise ValueError("LLM 统计数据库不可用")
         rows = self.usage_store.query(group_ids=groups, since=time.time() - days * 86400,
                                       model=args[2] if len(args) > 2 else None)
         return rows, days
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("stats")
     async def qgaudit_stats(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         try:
             rows, days = await asyncio.to_thread(self._statistics_query, event)
             text = format_statistics(rows, days=days, enabled=self.config["llm_statistics"]["enabled"])
+        except PermissionError:
+            return
         except ValueError as exc:
             text = str(exc)
         except Exception:
@@ -2099,9 +2128,9 @@ class QQGroupAuditorPlugin(Star):
             text = "查询 LLM 统计失败，请查看日志"
         yield event.plain_result(text)
 
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @qgaudit.command("export")
     async def qgaudit_export(self, event: Any) -> None:
+        if not self._command_allowed(event):
+            return
         try:
             rows, _ = await asyncio.to_thread(self._statistics_query, event)
             if not rows:
@@ -2112,6 +2141,8 @@ class QQGroupAuditorPlugin(Star):
             directory = Path(_audit_database_path()).parent / "llm_exports"
             path = await asyncio.to_thread(self.usage_store.export_csv, rows, directory)
             yield event.chain_result([File(name=path.name, file=str(path.resolve()))])
+        except PermissionError:
+            return
         except ValueError as exc:
             yield event.plain_result(str(exc))
         except Exception:

@@ -132,8 +132,8 @@ async def test_stats_and_csv_respect_group_admin_permissions(monkeypatch, tmp_pa
     visible, days = plugin._statistics_query(FakeEvent(message="/qgaudit stats 7d all"))
     assert days == 7 and [r["group_id"] for r in visible] == ["123"]
     denied = await collect(plugin.qgaudit_stats(FakeEvent(message="/qgaudit stats 7d 456")))
-    assert denied == ["无权限"]
-    assert await collect(plugin.qgaudit_export(FakeEvent(message="/qgaudit export 7d 456"))) == ["无权限"]
+    assert denied == []
+    assert await collect(plugin.qgaudit_export(FakeEvent(message="/qgaudit export 7d 456"))) == []
     text = await collect(plugin.qgaudit_stats(FakeEvent(message="/qgaudit stats")))
     assert "调用 1 次" in text[0]
     components = types.ModuleType("astrbot.api.message_components")

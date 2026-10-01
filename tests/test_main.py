@@ -80,6 +80,13 @@ def install_astrbot_stub(monkeypatch: pytest.MonkeyPatch):
     filter_module.EventMessageType = EventMessageType
     filter_module.PlatformAdapterType = PlatformAdapterType
     filter_module.command_group = command_group
+    def command(name):
+        def decorator(func):
+            func.__qgaudit_filter_meta__ = getattr(func, "__qgaudit_filter_meta__", [])
+            func.__qgaudit_filter_meta__.append(("command", name))
+            return func
+        return decorator
+    filter_module.command = command
     filter_module.event_message_type = event_message_type
     filter_module.platform_adapter_type = platform_adapter_type
 
@@ -193,6 +200,10 @@ class FakeEvent:
         self.sender_id = sender_id
         self.platform_id = platform_id
         self.unified_msg_origin = unified_msg_origin
+        self.stopped = False
+
+    def stop_event(self):
+        self.stopped = True
 
     def get_sender_id(self):
         return self.sender_id
@@ -248,23 +259,19 @@ async def collect(async_iterable):
     return [item async for item in async_iterable]
 
 
-def test_import_registers_qgaudit_group_and_all_request_handler(monkeypatch):
+def test_import_registers_private_untyped_command_and_all_request_handler(monkeypatch):
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
     assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.4.1"
-    assert [group.name for group in command_groups] == ["qgaudit"]
+    assert command_groups == []
 
-    command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_test, "__qgaudit_filter_meta__", [])
-    assert ("command", "qgaudit", "test") in command_meta
+    command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_command, "__qgaudit_filter_meta__", [])
+    assert ("command", "qgaudit") in command_meta
     assert ("event_message_type", EventMessageType.PRIVATE_MESSAGE) in command_meta
-    backfill_meta = getattr(
-        module.QQGroupAuditorPlugin.qgaudit_backfill,
-        "__qgaudit_filter_meta__",
-        [],
-    )
-    assert ("command", "qgaudit", "backfill") in backfill_meta
-    assert ("event_message_type", EventMessageType.PRIVATE_MESSAGE) in backfill_meta
+    for name in ("test", "backfill", "history", "detail", "stats", "export"):
+        assert not getattr(getattr(module.QQGroupAuditorPlugin, "qgaudit_" + name),
+                           "__qgaudit_filter_meta__", [])
 
     handler_meta = getattr(
         module.QQGroupAuditorPlugin.handle_group_request,
@@ -328,8 +335,45 @@ async def test_private_test_command_requires_group_admin(monkeypatch):
 
     results = await collect(plugin.qgaudit_test(event))
 
-    assert results == ["无权限"]
+    assert results == []
     assert context.llm_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", [
+    "qgaudit", "qgaudit help", "qgaudit unknown", "qgaudit test",
+    "qgaudit test 123 答案", "qgaudit backfill", "qgaudit backfill 123",
+    "qgaudit history 123 20002", "qgaudit detail 123 1", "qgaudit detail 123 not-id",
+    "qgaudit stats", "qgaudit stats abc", "qgaudit export 7d all",
+])
+async def test_command_dispatch_is_silent_for_members(monkeypatch, tmp_path, message):
+    module, _ = import_main(monkeypatch)
+    monkeypatch.setattr(module, "_audit_database_path", lambda: tmp_path / "audit.sqlite3")
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    event = FakeEvent(message=message, sender_id="20002")
+    try:
+        assert await collect(plugin.qgaudit_command(event)) == []
+        assert event.stopped and context.llm_calls == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_preserves_admin_help_usage_and_answer_spaces(monkeypatch, tmp_path):
+    module, _ = import_main(monkeypatch)
+    monkeypatch.setattr(module, "_audit_database_path", lambda: tmp_path / "audit.sqlite3")
+    context = FakeContext()
+    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    try:
+        assert "/qgaudit history" in (await collect(plugin.qgaudit_command(FakeEvent(message="qgaudit"))))[0]
+        assert "用法" in (await collect(plugin.qgaudit_command(FakeEvent(message="qgaudit test"))))[0]
+        results = await collect(plugin.qgaudit_command(FakeEvent(message="qgaudit test 123 alpha  beta")))
+        assert "approve=True" in results[0]
+        assert "alpha  beta" in context.llm_calls[0]["prompt"]
+        assert await collect(plugin.qgaudit_command(FakeEvent(message="qgaudit test 456 答案"))) == []
+    finally:
+        await plugin.terminate()
 
 
 @pytest.mark.asyncio
