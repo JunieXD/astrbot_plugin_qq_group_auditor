@@ -68,5 +68,75 @@
     "answer": "23-hnust",
     "approve": true,
     "school": "湖南科技大学"
+  },
+  {
+    "answer": "大三njtu",
+    "approve": false,
+    "school": ""
+  },
+  {
+    "answer": "24-NJTU",
+    "approve": false,
+    "school": ""
+  },
+  {
+    "answer": "大三NJTU（南京工业大学）",
+    "approve": false,
+    "school": ""
+  },
+  {
+    "answer": "24-cqupt",
+    "approve": true,
+    "school": "重庆邮电大学"
+  },
+  {
+    "answer": "24-CQUPT",
+    "approve": true,
+    "school": "重庆邮电大学"
+  },
+  {
+    "answer": "24haut",
+    "approve": true,
+    "school": "河南工业大学"
+  },
+  {
+    "answer": "24-HAUT",
+    "approve": true,
+    "school": "河南工业大学"
+  },
+  {
+    "answer": "24级NUC",
+    "approve": true,
+    "school": "中北大学"
+  },
+  {
+    "answer": "24-nuc",
+    "approve": true,
+    "school": "中北大学"
+  },
+  {
+    "answer": "大三 Northern Jiaotong University",
+    "approve": false,
+    "school": "北京交通大学"
+  },
+  {
+    "answer": "大三南京工业大学",
+    "approve": true,
+    "school": "南京工业大学"
+  },
+  {
+    "answer": "大三NJTECH",
+    "approve": true,
+    "school": "南京工业大学"
+  },
+  {
+    "answer": "大四-neau，求你了，我情商低，真得好低，求包容，求求了",
+    "approve": false,
+    "school": "东北农业大学"
+  },
+  {
+    "answer": "24-CQUPT（重庆大学）",
+    "approve": false,
+    "school": ""
   }
 ]

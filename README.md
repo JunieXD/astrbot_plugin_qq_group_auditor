@@ -74,7 +74,7 @@ NapCat 当前群系统消息接口只能说明申请是否已处理以及操作�
 | `ecnu_thinking` | `inherit` | `inherit` 继承共享模型设置；`enabled` 开启；`disabled` 关闭。 |
 | `ecnu_reasoning_effort` | `low` | 仅在本插件设置 `enabled` 时覆盖档位。Plus 支持 `low/medium/xhigh`，Max 支持 `low/high/max`。 |
 
-推荐 ECNU Plus 开启 `low` 思考和 JSON Schema。配置适用于本插件管理的所有群，但各群仍使用自己的审核提示词。学校群可参考 [非985非211提示词](docs/prompts/non985-non211.txt) 或 [四非提示词](docs/prompts/four-non.txt)，按实际入群政策选择。四非示例采用 2022 年第二轮双一流 147 校名单（含985、211），允许可靠识别的简称；参考表修正 SDUT、SDUST、HBUT，不能识别或信息冲突时留人工。其他群无需改动规则。非985非211示例允许非985非211的双一流高校；“待确认”输出为 `approve=false`，随后遵循该群 `failure_action`，不是独立人工审核队列。
+推荐 ECNU Plus 开启 `low` 思考和 JSON Schema。配置适用于本插件管理的所有群，但各群仍使用自己的审核提示词。学校群可参考 [非985非211提示词](docs/prompts/non985-non211.txt) 或 [四非提示词](docs/prompts/four-non.txt)，按实际入群政策选择。四非示例采用 2022 年第二轮双一流 147 校名单（含985、211），允许可靠识别的简称；参考表修正 SDUT、SDUST、HBUT、CQUPT、HAUT、NUC 等实际误识别；NJTU 不直接推断为南京工业大学，仅写该缩写或与全称冲突时留人工，明确的南京工业大学 / NJTECH 仍可按规则通过。不能识别或信息冲突时留人工。其他群无需改动规则。非985非211示例允许非985非211的双一流高校；“待确认”输出为 `approve=false`，随后遵循该群 `failure_action`，不是独立人工审核队列。
 
 部分 AstrBot 4.x 版本会丢弃 `llm_generate` 的生成参数。插件为 ECNU 的 OpenAI Chat Completion 适配器创建请求专用副本，通过 `custom_extra_body` 传入参数；SDK 配置也独立复制，连接池仍归原 Provider 管理。保留其他模型配置、认证、代理、超时、重试和原始用量。不会临时改写共享 Provider、修改全局模型配置或给其他插件强加 JSON 输出。已有共享模型里的思考配置依然作用于其他调用；如需其他调用默认关闭，应另行移除共享配置中的思考覆盖项。
 
