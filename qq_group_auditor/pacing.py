@@ -73,7 +73,7 @@ def get_guard(context, data_root):
 
 class ActionGuard:
     deferred_error = ActionDeferred
-    scheduling_version = 4
+    scheduling_version = 5
 
     def __init__(self, path):
         self.path = Path(path)
@@ -113,6 +113,17 @@ class ActionGuard:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.accounts, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.path)
+
+    def defer_recovery(self, account, seconds):
+        """Persist a detected reconnect's recovery deadline for all plugins.
+
+        Never shorten an existing recovery/cooldown or clear an uncertain write.
+        A hot reload reuses this state and the live account locks/queue.
+        """
+        state = self.accounts.setdefault(account, {})
+        state["recovery_until"] = max(state.get("recovery_until", 0), time.time() + seconds)
+        self._save()
+        self._wake_queue(account)
 
     async def run(self, *, account, online, action, config, delay=(0, 0),
                   gap=(8, 15), key=None, dedup_seconds=604800,
@@ -187,8 +198,10 @@ class ActionGuard:
             if state.pop("was_offline", False):
                 # Recovery applies to the account, including tasks already
                 # waiting outside the lock. Persist it across plugin reloads.
-                state["recovery_until"] = time.time() + random.uniform(
-                    *delay_range(config, "recovery"))
+                state["recovery_until"] = max(
+                    state.get("recovery_until", 0),
+                    time.time() + random.uniform(*delay_range(config, "recovery")),
+                )
                 self._save()
 
         def deadline():

@@ -9,7 +9,7 @@
     "description": "后台同步间隔（秒）",
     "type": "int",
     "default": 600,
-    "hint": "默认 10 分钟，最少 300 秒。掉线或接口失败会逐步延长重试间隔，最长至少 1 小时；实时审核不受此间隔影响。"
+    "hint": "默认 10 分钟，最少 300 秒。接口失败逐步退避；连接恢复会取消旧退避，经过恢复等待后补查。实时审核异步处理。"
   },
   "group_audits": {
     "description": "QQ群加群审核配置",
@@ -124,12 +124,14 @@
       "review_min_seconds": {
         "description": "自动审核等待最小秒数",
         "type": "int",
-        "default": 5
+        "default": 5,
+        "hint": "从收到申请开始计时，与模型调用同时进行；模型返回后只补足剩余等待。邀请同样等待。"
       },
       "review_max_seconds": {
         "description": "自动审核等待最大秒数",
         "type": "int",
-        "default": 15
+        "default": 15,
+        "hint": "单次审批耗时约为模型处理与随机等待的较大值，再加账号排队及接口耗时。"
       },
       "card_min_seconds": {
         "description": "确认入群后名片等待最小秒数",
@@ -347,7 +349,25 @@
           "max"
         ],
         "hint": "仅在本插件开启思考时生效。Plus 支持 low / medium / xhigh；Max 支持 low / high / max。推荐 low。不支持的组合会报错，不会静默换档。"
+      },
+      "timeout_seconds": {
+        "description": "模型审核总超时（秒）",
+        "type": "int",
+        "default": 45,
+        "hint": "范围 1–300 秒，包含并发排队及 JSON 格式重试。超时只留待人工处理，即使不符合时动作配置为 reject，也不会因此拒绝申请。ECNU 请求关闭 SDK 内部网络重试，仅影响本插件。"
+      },
+      "slow_seconds": {
+        "description": "等待模型结果的慢调用提醒（秒）",
+        "type": "int",
+        "default": 15,
+        "hint": "0 表示关闭；达到此时间会记录日志和审核阶段，继续等到总超时。不会因慢调用重复请求模型。"
       }
     }
+  },
+  "recovery_probe_interval_seconds": {
+    "description": "离线恢复状态检查间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "范围 30–300 秒。离线退避期间只检查 NapCat 本地状态；恢复后按恢复等待补查申请。正常群系统消息同步仍按后台同步间隔。"
   }
 }

@@ -461,3 +461,20 @@ async def is_onebot_online(context: Any, *, platform_id: str) -> bool:
         return False
     data = await asyncio.wait_for(bot.call_action(action="get_status"), timeout=10)
     return isinstance(data, dict) and data.get("online") is True
+
+
+def onebot_connection_token(context: Any, *, platform_id: str) -> tuple[int, ...] | None:
+    """Observe local transport state without sending a OneBot/QQ request.
+
+    None means this adapter cannot expose its connection state; an empty tuple
+    means disconnected. Client identity also detects a fast disconnect/reconnect
+    between background ticks.
+    """
+    try:
+        bot = find_onebot_bot(context, platform_id=platform_id)
+    except PlatformActionError:
+        return None
+    clients = getattr(bot, "_wsr_api_clients", None)
+    if not isinstance(clients, dict):
+        return None
+    return tuple(sorted(id(client) for client in clients.values()))

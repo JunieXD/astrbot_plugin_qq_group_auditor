@@ -103,7 +103,9 @@ def format_detail(record: dict[str, Any] | None) -> str:
             lines.append(f"  原因：{action.get('reason')}")
     phases = record.get("phases") or []
     labels = {
-        "review_start": "开始审核", "llm_queued": "等待模型并发槽", "llm_start": "模型开始",
+        "review_start": "开始审核", "review_delay": "审核最早操作等待",
+        "llm_slow": "等待模型结果较慢", "llm_timeout": "模型超时待人工",
+        "llm_queued": "等待模型并发槽", "llm_start": "模型开始",
         "llm_end": "模型返回/结束", "llm_parsed": "输出校验", "action_queued": "审批入队",
         "action_wait": "审批等待", "online_check_start": "在线检查开始", "online_check_end": "在线检查结束",
         "platform_start": "平台操作开始", "platform_end": "平台操作结束", "platform_skipped": "平台操作跳过",

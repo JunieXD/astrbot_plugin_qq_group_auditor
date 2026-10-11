@@ -913,6 +913,17 @@ class AuditStore:
                 (answer, application_id),
             )
 
+    def enrich_application(self, application_id: int, *, question: str = "", nickname: str = "") -> None:
+        """Complete optional metadata without rewriting the reviewed answer."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE applications SET "
+                "question=CASE WHEN ? != '' THEN ? ELSE question END, "
+                "question_source=CASE WHEN ? != '' THEN 'platform' ELSE question_source END, "
+                "nickname=CASE WHEN ? != '' THEN ? ELSE nickname END WHERE id=?",
+                (question, question, question, nickname, nickname, application_id),
+            )
+
     def update_application_nickname(self, application_id: int, nickname: str) -> None:
         with self._lock, self._connection:
             self._connection.execute(

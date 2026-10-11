@@ -107,3 +107,92 @@ async def test_disconnected_onebot_skips_even_local_status_call():
     assert not await is_onebot_online(PlatformContext(bot), platform_id=None)
     bot.response = {"online": True}
     assert await is_onebot_online(PlatformContext(bot), platform_id=None)
+
+
+@pytest.mark.asyncio
+async def test_reconnected_transport_clears_long_backoff_once_and_waits_for_recovery(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    now, token, connected = [1000.0], [()], [False]
+    calls, status_checks = [], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: a)
+    monkeypatch.setattr(module, "onebot_connection_token", lambda *a, **k: token[0])
+
+    async def online(*a, **k):
+        status_checks.append(now[0])
+        return connected[0]
+
+    async def reconcile(pid):
+        calls.append((pid, now[0]))
+
+    monkeypatch.setattr(module, "is_onebot_online", online)
+    monkeypatch.setattr(plugin, "_reconcile_platform", reconcile)
+    await plugin._poll_platform("bot")
+    plugin._sync_next_at["bot"] = 4600
+    now[0] = 1010
+    connected[0], token[0] = True, (1,)
+    await plugin._poll_platform("bot")
+    assert plugin._sync_next_at["bot"] == 1070
+    assert calls == [] and status_checks == [1000]
+    assert "bot" not in plugin._sync_failures
+    now[0] = 1069
+    await plugin._poll_platform("bot")
+    assert calls == []
+    now[0] = 1070
+    await plugin._poll_platform("bot")
+    assert calls == [("bot", 1070)]
+    assert plugin._sync_next_at["bot"] == 1670
+    await plugin._poll_platform("bot")
+    assert calls == [("bot", 1070)]
+    # A quick reconnect with no observed empty tick is also detected.
+    now[0] = 1080
+    token[0] = (2,)
+    await plugin._poll_platform("bot")
+    assert plugin._sync_next_at["bot"] == 1140
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_qq_login_recovery_probes_only_local_status_not_group_messages(monkeypatch):
+    module, _ = import_main(monkeypatch)
+    plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
+    now, connected = [1000.0], [False]
+    checks, calls = [], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.random, "uniform", lambda a, b: a)
+    monkeypatch.setattr(module, "onebot_connection_token", lambda *a, **k: (1,))
+
+    async def status(*a, **k):
+        checks.append(now[0])
+        return connected[0]
+
+    async def reconcile(pid):
+        calls.append(now[0])
+
+    monkeypatch.setattr(module, "is_onebot_online", status)
+    monkeypatch.setattr(plugin, "_reconcile_platform", reconcile)
+    await plugin._poll_platform("bot")
+    plugin._sync_next_at["bot"] = 4600
+    now[0] = 1029
+    await plugin._poll_platform("bot")
+    assert checks == [1000] and calls == []
+    now[0], connected[0] = 1030, True
+    await plugin._poll_platform("bot")
+    assert checks == [1000, 1030] and calls == []
+    assert plugin._sync_next_at["bot"] == 1090
+    now[0] = 1090
+    await plugin._poll_platform("bot")
+    assert calls == [1090]
+    await plugin.terminate()
+
+
+def test_connection_token_observes_client_identity_without_network():
+    from qq_group_auditor.platform import onebot_connection_token
+    bot = FakeBot()
+    bot._wsr_api_clients = {}
+    assert onebot_connection_token(PlatformContext(bot), platform_id=None) == ()
+    client = object()
+    bot._wsr_api_clients = {"bot": client}
+    assert onebot_connection_token(PlatformContext(bot), platform_id=None) == (id(client),)
+    assert bot.calls == []

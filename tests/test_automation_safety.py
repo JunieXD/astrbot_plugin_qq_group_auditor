@@ -1,3 +1,4 @@
+from test_main import deliver_request, drain_reviews
 import asyncio
 
 import pytest
@@ -22,8 +23,9 @@ async def test_invitation_keeps_policy_but_uses_configured_delay(monkeypatch):
     monkeypatch.setattr(module, "set_group_request", write)
     event = FakeRequestEvent()
     event.message_obj.raw_message["comment"] = ""
-    await plugin.handle_group_request(event)
-    assert calls == [("napcat-1", (22, 33)), True]
+    await deliver_request(plugin, event)
+    assert calls[0][0] == "napcat-1" and calls[1] is True
+    assert calls[0][1][0] == calls[0][1][1] and 21.9 <= calls[0][1][0] <= 33
     assert not plugin.context.llm_calls
     await plugin.terminate()
 
@@ -47,8 +49,10 @@ async def test_invitation_uses_group_delay_and_approval_priority(monkeypatch):
     monkeypatch.setattr(module, "set_group_request", write)
     event = FakeRequestEvent()
     event.message_obj.raw_message["comment"] = ""
-    await plugin.handle_group_request(event)
-    assert queued == [("123", 0, (20, 25), (8, 15))]
+    await deliver_request(plugin, event)
+    assert len(queued) == 1
+    assert queued[0][:2] == ("123", 0) and queued[0][3] == (8, 15)
+    assert queued[0][2][0] == queued[0][2][1] and 19.9 <= queued[0][2][0] <= 25
     assert not plugin.context.llm_calls
     await plugin.terminate()
 
@@ -124,10 +128,10 @@ async def test_cached_question_and_duplicate_request_do_not_repeat_lookup(monkey
     monkeypatch.setattr(module, "get_group_question", question)
     monkeypatch.setattr(module, "set_group_request", write)
     event = FakeRequestEvent()
-    await plugin.handle_group_request(event)
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
+    await deliver_request(plugin, event)
     event.message_obj.raw_message["flag"] = "second"
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
     assert reads == [True]
     await plugin.terminate()
 

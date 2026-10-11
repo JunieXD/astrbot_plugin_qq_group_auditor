@@ -1,3 +1,4 @@
+from test_main import deliver_request, drain_reviews
 import asyncio
 import sqlite3
 import sys
@@ -42,14 +43,14 @@ async def test_real_review_links_metrics_but_invite_does_not_call_llm(monkeypatc
         calls.append(kwargs)
     monkeypatch.setattr(module, "set_group_request", approve)
     event = FakeRequestEvent()
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
     history = plugin.audit_store.history(group_id="123", applicant_qq="20002")
     rows = plugin.usage_store.query(group_ids=["123"])
     assert len(rows) == 1 and rows[0]["application_id"] == history[0]["id"]
     assert rows[0]["status"] == "success" and rows[0]["source"] == "plugin"
     assert rows[0]["input_tokens"] is None  # Fake provider has no usage.
     event.message_obj.raw_message.update(flag="invite", user_id=20003, comment="")
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
     assert len(plugin.usage_store.query(group_ids=["123"])) == 1
     assert len(calls) == 2
     await plugin.terminate()
@@ -103,7 +104,7 @@ async def test_unavailable_statistics_database_does_not_block_approval(monkeypat
     async def approve(*args, **kwargs):
         calls.append(kwargs)
     monkeypatch.setattr(module, "set_group_request", approve)
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
     assert calls[0]["approve"] is True
     assert plugin.usage_store is None
     await plugin.terminate()
@@ -173,7 +174,7 @@ async def test_review_timeline_persists_model_queue_platform_and_total(monkeypat
     async def approve(*args, **kwargs):
         pass
     monkeypatch.setattr(module, 'set_group_request', approve)
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
     app = plugin.audit_store.history(group_id='123', applicant_qq='20002')[0]
     record = plugin.audit_store.detail(group_id='123', application_id=app['id'])
     stages = [r['phase'] for r in record['phases']]
@@ -197,6 +198,6 @@ async def test_timeline_write_failure_keeps_review_and_approval(monkeypatch):
         calls.append(kwargs)
     monkeypatch.setattr(plugin.audit_store, 'record_phase', broken)
     monkeypatch.setattr(module, 'set_group_request', approve)
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
     assert calls[0]['approve'] is True
     await plugin.terminate()

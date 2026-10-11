@@ -45,6 +45,7 @@ try:
         is_onebot_online,
         get_user_nickname,
         onebot_platform_ids,
+        onebot_connection_token,
         set_group_card,
         set_group_request,
     )
@@ -85,6 +86,7 @@ except ImportError:  # pragma: no cover - supports direct local imports in tests
         is_onebot_online,
         get_user_nickname,
         onebot_platform_ids,
+        onebot_connection_token,
         set_group_card,
         set_group_request,
     )
@@ -102,7 +104,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 _EXTERNAL_REJECTION_GRACE_SECONDS = 120
-_RECONCILE_INTERVAL_SECONDS = 60
+_RECONCILE_INTERVAL_SECONDS = 30
 _JOIN_CONFIRM_RETRY_DELAYS = (60, 180, 600)
 _CARD_ACTION_DELAY_RANGE_SECONDS = (0.8, 2.2)
 _CATCH_UP_ACTION_DELAY_RANGE_SECONDS = (2.0, 5.0)
@@ -271,14 +273,34 @@ class RuntimeReviewer:
     ) -> ReviewDecision:
         client = AstrBotLLMClient(self.context, self.umo, group_id=request.group_id,
                                  **self.statistics_options)
-        return await review_answer(
-            client,
-            group_id=request.group_id,
-            applicant_qq=request.applicant_qq,
-            answer=request.answer,
-            review_prompt=str(group_config.get("review_prompt") or ""),
-            on_response=client.response_parsed,
-        )
+        timeout = client.options["timeout_seconds"]
+        slow = client.options["slow_seconds"]
+
+        async def warn_slow():
+            await asyncio.sleep(slow)
+            client._emit("llm_slow", seconds=slow)
+            logger.warning("审核等待模型结果超过 %s 秒：申请=%s，群=%s；到 %s 秒将转人工",
+                           slow, client.metadata["application_id"], request.group_id, timeout)
+
+        warning = asyncio.create_task(warn_slow()) if slow and slow < timeout else None
+        try:
+            return await asyncio.wait_for(review_answer(
+                client,
+                group_id=request.group_id,
+                applicant_qq=request.applicant_qq,
+                answer=request.answer,
+                review_prompt=str(group_config.get("review_prompt") or ""),
+                on_response=client.response_parsed,
+            ), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            client._emit("llm_timeout", seconds=timeout)
+            if client.statistics is not None:
+                client.statistics.timed_out(client.last_call_id)
+            raise LLMReviewError(f"模型审核超过 {timeout:g} 秒，申请留待人工处理") from exc
+        finally:
+            if warning is not None:
+                warning.cancel()
+                await asyncio.gather(warning, return_exceptions=True)
 
 
 class RuntimePlatform:
@@ -441,7 +463,7 @@ class _PendingEmptyReview:
     task: asyncio.Task[None] | None = None
 
 
-@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.4.1")
+@register("qq_group_auditor", "Junie", "QQ group join request auditor", "0.4.2")
 class QQGroupAuditorPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context=context, config=config)
@@ -449,10 +471,18 @@ class QQGroupAuditorPlugin(Star):
         self.config = normalize_config(dict(config or {}))
         self._reconcile_task: asyncio.Task[None] | None = None
         self._application_tasks: dict[int, asyncio.Task[None]] = {}
+        self._review_tasks: dict[int, asyncio.Task] = {}
+        self._review_updates: dict[int, dict] = {}
+        self._metadata_tasks: dict[int, asyncio.Task] = {}
+        self._sync_tasks: dict[str, asyncio.Task] = {}
         self._review_locks: dict[int, asyncio.Lock] = {}
         self._sync_locks: dict[str, asyncio.Lock] = {}
         self._sync_next_at: dict[str, float] = {}
         self._sync_failures: dict[str, int] = {}
+        self._sync_offline: set[str] = set()
+        self._sync_transports: dict[str, tuple[int, ...]] = {}
+        self._sync_probe_next_at: dict[str, float] = {}
+        self._sync_recovery_until: dict[str, float] = {}
         self._pending_empty_reviews: dict[tuple[str, str, str], _PendingEmptyReview] = {}
         self._empty_answer_tasks: set[asyncio.Task[None]] = set()
         self._member_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
@@ -487,11 +517,17 @@ class QQGroupAuditorPlugin(Star):
 
     async def terminate(self) -> None:
         self._stopped = True
-        tasks = list(self._action_tasks | self._llm_tasks)
+        tasks = list(self._action_tasks | self._llm_tasks
+                     | set(self._review_tasks.values()) | set(self._metadata_tasks.values())
+                     | set(self._sync_tasks.values()))
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._review_tasks.clear()
+        self._review_updates.clear()
+        self._metadata_tasks.clear()
+        self._sync_tasks.clear()
         empty_tasks = list(self._empty_answer_tasks)
         self._pending_empty_reviews.clear()
         for task in empty_tasks:
@@ -608,7 +644,7 @@ class QQGroupAuditorPlugin(Star):
             self._finish_obsolete_request(request, application_id, *blocker)
             raise ActionDeferred(blocker[1])
         if detail and (detail["answer"] != request.answer or detail["request_kind"] != request.request_kind):
-            # A same-flag enrichment is reviewed by its waiting handler, not by
+            # A same-flag enrichment is reviewed by its waiting worker, not by
             # the older empty-answer/invitation decision. It is not terminal.
             raise ActionDeferred("申请内容已更新，等待使用新内容审核")
 
@@ -636,6 +672,9 @@ class QQGroupAuditorPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def handle_group_request(self, event: Any) -> None:
+        received_at = time.monotonic()
+        if self._stopped:
+            return
         try:
             request = extract_join_request(event)
         except ValueError:
@@ -676,7 +715,7 @@ class QQGroupAuditorPlugin(Star):
         if group_config is None:
             return
 
-        await self._review_application(
+        self._schedule_review(
             group_config=group_config,
             request=request,
             application_id=application_id,
@@ -685,7 +724,84 @@ class QQGroupAuditorPlugin(Star):
             action_source=(
                 "invite_policy" if request.request_kind == "invite" else "plugin"
             ),
+            received_at=received_at,
         )
+        self._schedule_metadata(request, group_policy, application_id, platform_id)
+        if platform_id in self._sync_offline:
+            self._schedule_recovery_sync(platform_id)
+
+    def _schedule_review(self, *, received_at: float | None = None, **kwargs) -> bool:
+        """Persist first, then dispatch without blocking AstrBot's event bus."""
+        application_id = kwargs["application_id"]
+        if self._stopped or application_id is None:
+            return False
+        if self.audit_store is None or self.audit_store.has_review_action(application_id):
+            return False
+        active = self._review_tasks.get(application_id)
+        if active is not None and not active.done():
+            # Same-flag answer enrichment must run after the old decision has
+            # stopped. Do not cancel a possibly submitted platform write.
+            self._review_updates[application_id] = kwargs
+            return False
+        received_at = time.monotonic() if received_at is None else received_at
+        delay = random.uniform(*review_delay(self.config, kwargs["group_config"]))
+        ready_at = received_at + delay
+        async def run():
+            current = kwargs
+            try:
+                while not self._stopped:
+                    await self._review_application(**current, ready_at=ready_at)
+                    current = self._review_updates.pop(application_id, None)
+                    if (current is None or self.audit_store is None
+                            or self.audit_store.has_review_action(application_id)):
+                        return
+            finally:
+                self._review_updates.pop(application_id, None)
+        task = asyncio.create_task(run())
+        self._review_tasks[application_id] = task
+
+        def completed(done):
+            if self._review_tasks.get(application_id) is done:
+                self._review_tasks.pop(application_id, None)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error("后台加群审核失败：申请=%s，错误=%s", application_id,
+                             type(done.exception()).__name__)
+        task.add_done_callback(completed)
+        return True
+
+    def _schedule_metadata(self, request, group_config, application_id, platform_id):
+        if self._stopped or application_id is None or application_id in self._metadata_tasks:
+            return
+        task = asyncio.create_task(self._enrich_metadata(request, group_config, application_id, platform_id))
+        self._metadata_tasks[application_id] = task
+        def completed(done):
+            if self._metadata_tasks.get(application_id) is done:
+                self._metadata_tasks.pop(application_id, None)
+            if not done.cancelled() and done.exception() is not None:
+                logger.warning("申请资料补充失败，审核继续：申请=%s，错误=%s", application_id,
+                               type(done.exception()).__name__)
+        task.add_done_callback(completed)
+
+    async def _enrich_metadata(self, request, group_config, application_id, platform_id):
+        question, nickname = "", ""
+        try:
+            question = await asyncio.wait_for(self._cached_lookup(
+                ("question", platform_id, request.group_id),
+                lambda: get_group_question(self.context, group_id=request.group_id, platform_id=platform_id),
+            ), timeout=10)
+        except Exception:
+            logger.debug("failed to enrich group application question", exc_info=True)
+        if (group_config.get("auto_set_card") and "{nickname}" in group_config.get("card_template", "")
+                and not request.nickname and request.request_kind != "invite"):
+            try:
+                nickname = await asyncio.wait_for(self._cached_lookup(
+                    ("nickname", platform_id, request.applicant_qq),
+                    lambda: get_user_nickname(self.context, user_id=request.applicant_qq, platform_id=platform_id),
+                ), timeout=10)
+            except Exception:
+                logger.debug("failed to enrich applicant nickname", exc_info=True)
+        if self.audit_store is not None:
+            self.audit_store.enrich_application(application_id, question=question or "", nickname=nickname or "")
 
     async def _review_application(
         self,
@@ -696,6 +812,7 @@ class QQGroupAuditorPlugin(Star):
         platform_id: str | None,
         unified_msg_origin: str | None,
         action_source: str,
+        ready_at: float | None = None,
     ) -> ActionResult | None:
         kwargs = dict(
             group_config=group_config,
@@ -704,6 +821,7 @@ class QQGroupAuditorPlugin(Star):
             platform_id=platform_id,
             unified_msg_origin=unified_msg_origin,
             action_source=action_source,
+            ready_at=ready_at,
         )
         try:
             self._check_review_request(request, application_id)
@@ -800,6 +918,7 @@ class QQGroupAuditorPlugin(Star):
         platform_id: str | None,
         unified_msg_origin: str | None,
         action_source: str,
+        ready_at: float | None = None,
     ) -> ActionResult | None:
         if application_id is None:
             return await self._run_application_review(
@@ -809,6 +928,7 @@ class QQGroupAuditorPlugin(Star):
                 platform_id=platform_id,
                 unified_msg_origin=unified_msg_origin,
                 action_source=action_source,
+                ready_at=ready_at,
             )
         lock = self._review_locks.setdefault(application_id, asyncio.Lock())
         async with lock:
@@ -824,6 +944,7 @@ class QQGroupAuditorPlugin(Star):
                 platform_id=platform_id,
                 unified_msg_origin=unified_msg_origin,
                 action_source=action_source,
+                ready_at=ready_at,
             )
 
     def _trace_application(self, application_id, phase, **details):
@@ -846,11 +967,28 @@ class QQGroupAuditorPlugin(Star):
         platform_id: str | None,
         unified_msg_origin: str | None,
         action_source: str,
+        ready_at: float | None = None,
     ) -> ActionResult:
         started = time.perf_counter()
         def observe(phase, **details):
             self._trace_application(application_id, phase, **details)
         observe("review_start", source=action_source, request_kind=request.request_kind)
+        if ready_at is None:
+            ready_at = time.monotonic() + random.uniform(*review_delay(self.config, group_config))
+        observe("review_delay", remaining_seconds=max(0, ready_at - time.monotonic()))
+
+        async def execute(req, **kw):
+            remaining = max(0, ready_at - time.monotonic(),
+                            self._sync_recovery_until.get(platform_id, 0) - time.monotonic())
+            return await self._run_guarded(
+                platform_id,
+                lambda: self._execute_review_action(req, application_id, platform_id, source=action_source, **kw),
+                delay=(remaining, remaining),
+                key=f"review:{req.group_id}:{req.applicant_qq}:{req.flag}",
+                priority=0, group=req.group_id,
+                label=f"{'邀请' if req.request_kind == 'invite' else '申请'}审批 #{application_id}",
+                observer=observe,
+            )
         action_delay_seconds = (
             _catch_up_action_delay_seconds()
             if action_source == "plugin_catch_up"
@@ -865,15 +1003,7 @@ class QQGroupAuditorPlugin(Star):
                 self.context,
                 platform_id=platform_id,
                 action_delay_seconds=action_delay_seconds,
-                executor=lambda req, **kw: self._run_guarded(
-                    platform_id,
-                    lambda: self._execute_review_action(req, application_id, platform_id, source=action_source, **kw),
-                    delay=review_delay(self.config, group_config),
-                    key=f"review:{req.group_id}:{req.applicant_qq}:{req.flag}",
-                    priority=0, group=req.group_id,
-                    label=f"{'邀请' if req.request_kind == 'invite' else '申请'}审批 #{application_id}",
-                    observer=observe,
-                ),
+                executor=execute,
             ),
             RuntimeNotifier(
                 self.context, platform_id=platform_id, sender=self._send_notice,
@@ -908,6 +1038,11 @@ class QQGroupAuditorPlugin(Star):
             and group_config.get("auto_set_card", False)
             and request.request_kind != "invite"
         ):
+            # Optional metadata never delays the model or approval, but may be
+            # needed by a card template after approval is durably recorded.
+            metadata = self._metadata_tasks.get(application_id)
+            if metadata is not None:
+                await asyncio.gather(metadata, return_exceptions=True)
             confirmed = await self._reconcile_application_member(application_id)
             if confirmed in {None, "failed", "not_in_group"}:
                 self._schedule_application_reconciliation(application_id)
@@ -919,58 +1054,16 @@ class QQGroupAuditorPlugin(Star):
         group_config: dict[str, Any],
         platform_id: str | None,
     ) -> tuple[JoinRequest, int, bool]:
+        # No network lookup before the model. Register the latest flag and
+        # merge same-flag answer enrichment in one durable transaction.
         question = str(group_config.get("application_question") or "").strip()
-        question_source = "config" if question else "unknown"
-        # Register new flags before network lookups so queued older actions see
-        # them even while question/nickname enrichment is slow.
-        assert self.audit_store is not None
-        self.audit_store.record_application(
-            platform_id=platform_id or "aiocqhttp", request=request,
-            question=question, question_source=question_source,
-            review_prompt=str(group_config.get("review_prompt") or ""),
-        )
-        try:
-            platform_question = await self._cached_lookup(
-                ("question", platform_id, request.group_id),
-                lambda: get_group_question(self.context, group_id=request.group_id, platform_id=platform_id),
-            )
-        except Exception:
-            logger.debug("failed to fetch group application question", exc_info=True)
-        else:
-            if platform_question:
-                question = platform_question
-                question_source = "platform"
         raw_comment = request.raw_comment or request.answer
-        needs_nickname = "{nickname}" in str(
-            group_config.get("card_template") or "{nickname}"
-        )
-        if (
-            group_config.get("auto_set_card", False)
-            and needs_nickname
-            and not request.nickname
-            and request.request_kind != "invite"
-        ):
-            try:
-                nickname = await self._cached_lookup(
-                    ("nickname", platform_id, request.applicant_qq),
-                    lambda: get_user_nickname(self.context, user_id=request.applicant_qq, platform_id=platform_id),
-                )
-            except PlatformActionError:
-                logger.debug("failed to fetch applicant QQ nickname", exc_info=True)
-            else:
-                request = replace(request, nickname=nickname)
-        request = replace(
-            request,
-            question=question,
-            answer=extract_application_answer(raw_comment),
-            raw_comment=raw_comment,
-        )
+        request = replace(request, question=question,
+                          answer=extract_application_answer(raw_comment), raw_comment=raw_comment)
         assert self.audit_store is not None
         application_id, _ = self.audit_store.record_application(
-            platform_id=platform_id or "aiocqhttp",
-            request=request,
-            question=question,
-            question_source=question_source,
+            platform_id=platform_id or "aiocqhttp", request=request,
+            question=question, question_source="config" if question else "unknown",
             review_prompt=str(group_config.get("review_prompt") or ""),
         )
         detail = self.audit_store.detail(group_id=request.group_id, application_id=application_id)
@@ -1731,12 +1824,33 @@ class QQGroupAuditorPlugin(Star):
                 if self.audit_store is not None:
                     platform_ids = onebot_platform_ids(self.context)
                     for platform_id in platform_ids:
-                        await self._poll_platform(platform_id)
+                        if platform_id not in self._sync_tasks:
+                            task = asyncio.create_task(self._poll_platform(platform_id))
+                            self._sync_tasks[platform_id] = task
+                            def completed(done, pid=platform_id):
+                                if self._sync_tasks.get(pid) is done:
+                                    self._sync_tasks.pop(pid, None)
+                                if not done.cancelled() and done.exception() is not None:
+                                    logger.warning("后台申请同步失败：平台=%s，错误=%s", pid,
+                                                   type(done.exception()).__name__)
+                            task.add_done_callback(completed)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("failed to reconcile external group actions", exc_info=True)
             await asyncio.sleep(_RECONCILE_INTERVAL_SECONDS)
+
+    def _schedule_recovery_sync(self, platform_id):
+        self._sync_offline.discard(platform_id)
+        self._sync_failures.pop(platform_id, None)
+        self._sync_probe_next_at.pop(platform_id, None)
+        delay = random.uniform(*delay_range(self.config["automation_pacing"], "recovery"))
+        self._sync_next_at[platform_id] = time.monotonic() + delay
+        self._sync_recovery_until[platform_id] = self._sync_next_at[platform_id]
+        persist = getattr(self.guard, "defer_recovery", None)
+        if callable(persist):
+            persist(platform_id, delay)
+        logger.info("OneBot 已恢复，取消旧同步退避：平台=%s，恢复等待=%.1f 秒后补查", platform_id, delay)
 
     async def _poll_platform(self, platform_id: str) -> None:
         if (
@@ -1749,12 +1863,39 @@ class QQGroupAuditorPlugin(Star):
         if lock.locked():
             return
         async with lock:
+            now = time.monotonic()
+            transport = onebot_connection_token(self.context, platform_id=platform_id)
+            if transport is not None:
+                previous = self._sync_transports.get(platform_id)
+                self._sync_transports[platform_id] = transport
+                if not transport:
+                    self._sync_offline.add(platform_id)
+                elif previous is not None and previous != transport:
+                    self._schedule_recovery_sync(platform_id)
+            # A NapCat transport can stay connected while QQ itself is offline.
+            # During offline backoff, probe only its local get_status at a bounded
+            # interval; do not repeatedly request group system messages.
+            if (platform_id in self._sync_offline and transport != ()
+                    and now < self._sync_next_at.get(platform_id, 0)
+                    and now >= self._sync_probe_next_at.get(platform_id, 0)):
+                self._sync_probe_next_at[platform_id] = now + self.config["recovery_probe_interval_seconds"]
+                try:
+                    if await is_onebot_online(self.context, platform_id=platform_id):
+                        self._schedule_recovery_sync(platform_id)
+                except Exception:
+                    pass
             if time.monotonic() < self._sync_next_at.get(platform_id, 0):
                 return
             interval = self.config["background_sync_interval_seconds"]
             try:
                 if not await is_onebot_online(self.context, platform_id=platform_id):
+                    self._sync_offline.add(platform_id)
+                    self._sync_probe_next_at[platform_id] = (
+                        time.monotonic() + self.config["recovery_probe_interval_seconds"])
                     raise PlatformActionError("QQ 未在线或 OneBot 连接已断开")
+                if platform_id in self._sync_offline:
+                    self._schedule_recovery_sync(platform_id)
+                    return
                 await self._reconcile_platform(platform_id)
             except Exception as exc:
                 failures = min(self._sync_failures.get(platform_id, 0) + 1, 6)
@@ -1888,7 +2029,7 @@ class QQGroupAuditorPlugin(Star):
         ):
             return False
         try:
-            await self._review_application(
+            return self._schedule_review(
                 group_config=enabled_group,
                 request=request,
                 application_id=application_id,
@@ -1901,7 +2042,7 @@ class QQGroupAuditorPlugin(Star):
                 "failed to catch up one pending group request: application=%s",
                 application_id,
             )
-        return True
+        return False
 
     def _command_allowed(self, event: Any, group_id: str | None = None) -> bool:
         sender = _sender_id(event)

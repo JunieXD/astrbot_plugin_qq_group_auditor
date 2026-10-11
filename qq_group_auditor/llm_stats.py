@@ -26,7 +26,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 STATUS_LABELS = {"pending": "进行中", "returned": "已返回待校验", "success": "有效输出",
                  "invalid_json": "无效输出", "provider_error": "接口异常", "cancelled": "已取消",
-                 "interrupted": "进程中断"}
+                 "interrupted": "进程中断", "timeout": "审核超时待人工"}
 SUMMARY_COLUMNS = (
     "id", "review_id", "application_id", "group_id", "source", "attempt", "started_at",
     "provider_id", "model", "status", "duration_ms", *TOKEN_FIELDS,
@@ -188,6 +188,22 @@ class UsageStore:
         def write():
             with self._db:
                 self._db.execute("UPDATE llm_calls SET status=? WHERE id=? AND status='returned'", (status, call_id))
+        self._safe(write)
+
+    def timed_out(self, call_id: int | None) -> None:
+        """A review deadline cancels the active attempt before marking timeout.
+
+        Preserve returned/invalid attempts and all unknown usage counters; a
+        cancelled request may still be billed by the provider.
+        """
+        if call_id is None:
+            return
+        def write():
+            with self._db:
+                self._db.execute(
+                    "UPDATE llm_calls SET status='timeout', error_type='TimeoutError' "
+                    "WHERE id=? AND status='cancelled'", (call_id,),
+                )
         self._safe(write)
 
     def query(self, *, group_ids: list[str], since: float = 0, until: float | None = None,

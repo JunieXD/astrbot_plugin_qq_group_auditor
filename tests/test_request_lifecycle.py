@@ -1,3 +1,4 @@
+from test_main import deliver_request, drain_reviews
 import asyncio
 import importlib.util
 
@@ -43,9 +44,9 @@ async def test_new_flag_supersedes_request_queued_for_approval(monkeypatch, comm
 
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", write)
-    old = asyncio.create_task(plugin.handle_group_request(event("old", comment=comment)))
+    old = asyncio.create_task(deliver_request(plugin, event("old", comment=comment)))
     await asyncio.wait_for(entered.wait(), 2)
-    await plugin.handle_group_request(event("new", 1001, comment))
+    await deliver_request(plugin, event("new", 1001, comment))
     release.set()
     await asyncio.wait_for(old, 2)
     assert calls == ["new"]
@@ -81,9 +82,9 @@ async def test_new_request_during_llm_discards_old_result_and_notification(monke
     monkeypatch.setattr(plugin.context, "llm_generate", llm)
     monkeypatch.setattr(module, "set_group_request", write)
     monkeypatch.setattr(module, "send_admin_notice", notice)
-    old = asyncio.create_task(plugin.handle_group_request(event("old", comment="old answer")))
+    old = asyncio.create_task(deliver_request(plugin, event("old", comment="old answer")))
     await asyncio.wait_for(entered.wait(), 2)
-    await plugin.handle_group_request(event("new", 1001))
+    await deliver_request(plugin, event("new", 1001))
     release.set()
     await asyncio.wait_for(old, 2)
     assert writes == ["new"]
@@ -107,11 +108,11 @@ async def test_out_of_order_numeric_flags_survive_reload(monkeypatch, tmp_path, 
 
     monkeypatch.setattr(module, "set_group_request", write)
     plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
-    await plugin.handle_group_request(event(new_flag))
+    await deliver_request(plugin, event(new_flag))
     await plugin.terminate()
     plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
-    await plugin.handle_group_request(event(old_flag, old_time))
-    await plugin.handle_group_request(event(new_flag))
+    await deliver_request(plugin, event(old_flag, old_time))
+    await deliver_request(plugin, event(new_flag))
     assert writes == [new_flag]
     assert not plugin.context.llm_calls
     assert record_for(plugin, old_flag)["actions"][0]["action"] == "superseded"
@@ -144,7 +145,7 @@ async def test_manual_processing_during_delay_finishes_old_request(monkeypatch, 
 
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", forbidden)
-    await plugin.handle_group_request(event("old"))
+    await deliver_request(plugin, event("old"))
     assert record_for(plugin, "old")["actions"][0]["action"] == "handled"
     await plugin.terminate()
 
@@ -165,7 +166,7 @@ async def test_rejoin_after_leave_is_a_fresh_application(monkeypatch):
         writes.append(kwargs["flag"])
 
     monkeypatch.setattr(module, "set_group_request", write)
-    await plugin.handle_group_request(event("new"))
+    await deliver_request(plugin, event("new"))
     assert writes == ["new"]
     await plugin.terminate()
 
@@ -200,7 +201,7 @@ async def test_missing_request_is_terminal_without_cooldown_but_real_errors_rema
     plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
     # Stub sending only, retaining real guard failure counting for approvals.
     monkeypatch.setattr(plugin, "_send_notice", notice)
-    await plugin.handle_group_request(event("old"))
+    await deliver_request(plugin, event("old"))
     state = guard.accounts["napcat-1"]
     if missing:
         assert state.get("failures", 0) == 0
@@ -215,7 +216,7 @@ async def test_missing_request_is_terminal_without_cooldown_but_real_errors_rema
         assert record_for(plugin, "old")["actions"][-1]["status"] == "failed"
     await plugin.terminate()
     plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
-    await plugin.handle_group_request(event("old"))
+    await deliver_request(plugin, event("old"))
     assert calls == ["old"]
     await plugin.terminate()
 
@@ -238,6 +239,7 @@ async def test_sync_persists_all_requests_before_review(monkeypatch, reverse):
     monkeypatch.setattr(module, "get_group_system_requests", requests)
     monkeypatch.setattr(module, "set_group_request", write)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     assert writes == ["222"]
     assert len(plugin.context.llm_calls) == 1
     assert record_for(plugin, "111")["actions"][0]["action"] == "superseded"
@@ -267,9 +269,9 @@ async def test_same_flag_invite_enrichment_requires_llm_before_approval(monkeypa
 
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", write)
-    old = asyncio.create_task(plugin.handle_group_request(event("same", comment="")))
+    old = asyncio.create_task(deliver_request(plugin, event("same", comment="")))
     await asyncio.wait_for(entered.wait(), 2)
-    fresh = asyncio.create_task(plugin.handle_group_request(event("same", comment="关键词答案")))
+    fresh = asyncio.create_task(deliver_request(plugin, event("same", comment="关键词答案")))
     await asyncio.sleep(0)
     release.set()
     await asyncio.wait_for(asyncio.gather(old, fresh), 2)
@@ -309,9 +311,9 @@ async def test_stale_ignore_notice_is_checked_after_notice_delay(monkeypatch):
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", write)
     monkeypatch.setattr(module, "send_admin_notice", notice)
-    old = asyncio.create_task(plugin.handle_group_request(event("old", comment="old answer")))
+    old = asyncio.create_task(deliver_request(plugin, event("old", comment="old answer")))
     await asyncio.wait_for(entered.wait(), 2)
-    await plugin.handle_group_request(event("new", 1001))
+    await deliver_request(plugin, event("new", 1001))
     release.set()
     await asyncio.wait_for(old, 2)
     assert not notices
@@ -345,15 +347,15 @@ async def test_new_request_is_registered_before_slow_enrichment(monkeypatch):
 
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", write)
-    old = asyncio.create_task(plugin.handle_group_request(event("old", comment="")))
+    old = asyncio.create_task(deliver_request(plugin, event("old", comment="")))
     await asyncio.wait_for(entered.wait(), 2)
     plugin._lookup_cache.clear()
     monkeypatch.setattr(module, "get_group_question", question)
-    new = asyncio.create_task(plugin.handle_group_request(event("new", 1001, "")))
+    new = asyncio.create_task(deliver_request(plugin, event("new", 1001, "")))
     await asyncio.wait_for(lookup_entered.wait(), 2)
     release.set()
     await asyncio.wait_for(old, 2)
-    assert not writes
+    assert writes == ["new"]  # Optional lookup no longer blocks the new request.
     lookup_release.set()
     await asyncio.wait_for(new, 2)
     assert writes == ["new"]
@@ -389,9 +391,9 @@ async def test_approval_is_durable_before_notice_and_blocks_another_queued_flag(
     monkeypatch.setattr(plugin.guard, "run", guarded)
     monkeypatch.setattr(module, "set_group_request", write)
     monkeypatch.setattr(plugin, "_send_notice", notice)
-    old = asyncio.create_task(plugin.handle_group_request(event("old", 900)))
+    old = asyncio.create_task(deliver_request(plugin, event("old", 900)))
     await asyncio.wait_for(entered.wait(), 2)
-    fresh = asyncio.create_task(plugin.handle_group_request(event("new", 999)))
+    fresh = asyncio.create_task(deliver_request(plugin, event("new", 999)))
     await asyncio.sleep(0)
     release.set()
     await asyncio.wait_for(notifying.wait(), 2)
@@ -404,7 +406,7 @@ async def test_approval_is_durable_before_notice_and_blocks_another_queued_flag(
     await asyncio.gather(old, return_exceptions=True)
     await plugin.terminate()
     plugin = module.QQGroupAuditorPlugin(FakeContext(), config)
-    await plugin.handle_group_request(event("old", 900))
+    await deliver_request(plugin, event("old", 900))
     assert writes == ["old"]
     assert not plugin.context.llm_calls
     await plugin.terminate()

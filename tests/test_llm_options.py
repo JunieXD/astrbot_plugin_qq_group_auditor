@@ -15,9 +15,10 @@ class SDKClient:
         self.api_key = "original"
         self.pool = object()
 
-    def with_options(self):
+    def with_options(self, **kwargs):
         client = SDKClient()
         client.pool = self.pool
+        client.options = kwargs
         return client
 
 
@@ -59,6 +60,7 @@ async def test_concurrent_overrides_do_not_leak_to_other_calls_or_sdk():
     assert provider.client.api_key == "original"
     assert enabled.client.pool is provider.client.pool
     assert enabled.client is not disabled.client
+    assert enabled.client.options == {"timeout": 45, "max_retries": 0}
     assert enabled.provider_config["custom_extra_body"] == {
         "thinking": {"type": "enabled"}, "reasoning_effort": "low",
         "response_format": REVIEW_RESPONSE_FORMAT, "max_tokens": 4000,
@@ -108,7 +110,20 @@ def test_normalize_bad_values():
     got = normalize_llm_review({"provider_id": " ecnu/ecnu-plus ", "ecnu_thinking": "bad",
                                 "ecnu_reasoning_effort": "bad", "ecnu_structured_output": "false"})
     assert got == {"provider_id": "ecnu/ecnu-plus", "ecnu_thinking": "inherit",
-                   "ecnu_reasoning_effort": "low", "ecnu_structured_output": False}
+                   "ecnu_reasoning_effort": "low", "ecnu_structured_output": False,
+                   "timeout_seconds": 45, "slow_seconds": 15}
+
+
+@pytest.mark.parametrize("raw,timeout,slow", [
+    ({"timeout_seconds": None, "slow_seconds": "bad"}, 45, 15),
+    ({"timeout_seconds": float("nan"), "slow_seconds": float("inf")}, 45, 15),
+    ({"timeout_seconds": 0, "slow_seconds": -1}, 1, 0),
+    ({"timeout_seconds": 999, "slow_seconds": 400}, 300, 300),
+    ({"timeout_seconds": 10, "slow_seconds": 20}, 10, 10),
+])
+def test_timeout_settings_are_finite_bounded_and_allow_disabled_warning(raw, timeout, slow):
+    got = normalize_llm_review(raw)
+    assert got["timeout_seconds"] == timeout and got["slow_seconds"] == slow
 
 
 @pytest.mark.asyncio

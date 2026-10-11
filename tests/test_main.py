@@ -10,6 +10,31 @@ from pathlib import Path
 import pytest
 
 
+async def drain_reviews(plugin):
+    """Wait for dispatched work only; empty-answer timers remain pending."""
+    while plugin._review_tasks:
+        await asyncio.gather(*list(plugin._review_tasks.values()))
+    if plugin._metadata_tasks:
+        await asyncio.gather(*list(plugin._metadata_tasks.values()))
+
+
+async def deliver_request(plugin, event):
+    await plugin.handle_group_request(event)
+    module = sys.modules[type(plugin).__module__]
+    request = module.extract_join_request(event)
+    if request is None or plugin.audit_store is None:
+        return
+    application_id = plugin.audit_store.get_application_id_by_flag(
+        platform_id=module._platform_id(event) or "aiocqhttp", self_id=request.self_id, flag=request.flag,
+    )
+    task = plugin._review_tasks.get(application_id)
+    if task is not None:
+        await task
+    metadata = plugin._metadata_tasks.get(application_id)
+    if metadata is not None:
+        await metadata
+
+
 class MessageChain:
     def __init__(self, chain=None):
         self.chain = list(chain or [])
@@ -263,7 +288,7 @@ def test_import_registers_private_untyped_command_and_all_request_handler(monkey
     module, command_groups = import_main(monkeypatch)
 
     assert hasattr(module, "QQGroupAuditorPlugin")
-    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.4.1"
+    assert module.QQGroupAuditorPlugin.__qgaudit_register__[0][-1] == "0.4.2"
     assert command_groups == []
 
     command_meta = getattr(module.QQGroupAuditorPlugin.qgaudit_command, "__qgaudit_filter_meta__", [])
@@ -515,7 +540,7 @@ async def test_group_request_handler_uses_raw_request_event_and_platform_id(
 
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
 
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
 
     assert platform_calls == [
         {
@@ -561,7 +586,7 @@ async def test_invite_approve_skips_llm_and_all_automatic_card_paths(monkeypatch
         {"comment": "", "time": 1900, "self_id": 99999}
     )
 
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
     await plugin.handle_group_membership_notice(
         FakeNoticeEvent(
             {
@@ -658,7 +683,7 @@ async def test_group_request_handler_uses_event_platform_id_for_admin_notice(
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
     monkeypatch.setattr(module, "send_admin_notice", fake_send_admin_notice)
 
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
 
     assert notice_platforms == ["napcat-1"]
 
@@ -676,7 +701,7 @@ async def test_group_request_handler_uses_event_unified_msg_origin_for_provider(
 
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
 
-    await plugin.handle_group_request(FakeRequestEvent())
+    await deliver_request(plugin, FakeRequestEvent())
 
     assert context.current_umo == "group-request-umo-1"
 
@@ -750,7 +775,7 @@ async def test_external_approval_sets_card_and_leave_closes_same_audit_record(mo
     request_event = FakeRequestEvent()
     request_event.message_obj.raw_message["time"] = 1900
     request_event.message_obj.raw_message["self_id"] = 99999
-    await plugin.handle_group_request(request_event)
+    await deliver_request(plugin, request_event)
     await plugin.handle_group_membership_notice(
         FakeNoticeEvent(
             {
@@ -832,8 +857,10 @@ async def test_reconcile_treats_external_handled_without_join_as_reject(monkeypa
     monkeypatch.setattr(module, "get_group_system_requests", fake_get_group_system_requests)
     monkeypatch.setattr(module.time, "time", lambda: 1000)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     monkeypatch.setattr(module.time, "time", lambda: 1120)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
     assert record["actions"][0]["action"] == "reject"
@@ -880,7 +907,7 @@ async def test_approved_request_sets_card_without_group_increase_notice(monkeypa
         }
     )
 
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
 
     assert cards == [
         {
@@ -1111,7 +1138,7 @@ async def test_approved_request_sets_card_without_member_cache_api(monkeypatch):
         }
     )
 
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
 
     assert cards == [
         {
@@ -1166,6 +1193,7 @@ async def test_reconcile_confirms_external_approval_before_inferring_rejection(m
     monkeypatch.setattr(module.time, "time", lambda: 1100)
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     record = plugin.audit_store.history(group_id="123", applicant_qq="20002")[0]
     platform_actions = [
@@ -1253,7 +1281,9 @@ async def test_reconcile_catches_up_pending_request_once(monkeypatch):
     monkeypatch.setattr(module.time, "time", lambda: 1000)
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     assert len(context.llm_calls) == 1
     assert platform_calls == [
@@ -1330,7 +1360,8 @@ async def test_reload_recovers_napcat_requests_interrupted_before_approval(
     await plugin.terminate()
     assert all(task.cancelled() for task in tasks)
     assert bot.calls == []
-    assert delay_ranges == [(5, 15), (5, 15)]
+    assert len(delay_ranges) == 2
+    assert all(lo == hi and 0 <= lo <= 15 for lo, hi in delay_ranges)
 
     # A new instance opens the persisted database and the real platform adapter
     # sees NapCat's raw payload, including a request handled during the reload.
@@ -1346,14 +1377,17 @@ async def test_reload_recovers_napcat_requests_interrupted_before_approval(
 
     monkeypatch.setattr(plugin.guard, "run", resumed_guard)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     approvals = [call for call in bot.calls if call["action"] == "set_group_add_request"]
     expected_flags = [str(row["request_id"]) for row in rows if not row["checked"]]
     assert [call["flag"] for call in approvals] == expected_flags
     assert all(call["approve"] is True for call in approvals)
     assert len(context.llm_calls) == len(expected_flags)
-    assert resumed_delays == [(5, 15)] * len(expected_flags)
+    assert len(resumed_delays) == len(expected_flags)
+    assert all(lo == hi and 0 <= lo <= 15 for lo, hi in resumed_delays)
     for row in rows:
         history = plugin.audit_store.history(
             group_id="123", applicant_qq=str(row["invitor_uin"]),
@@ -1373,7 +1407,9 @@ async def test_reload_recovers_napcat_requests_interrupted_before_approval(
 async def test_catch_up_waits_before_platform_approval(monkeypatch):
     module, _ = import_main(monkeypatch)
     context = FakeContext()
-    plugin = module.QQGroupAuditorPlugin(context, plugin_config())
+    config = plugin_config()
+    config["llm_review"] = {"slow_seconds": 0}
+    plugin = module.QQGroupAuditorPlugin(context, config)
     request = module.JoinRequest(
         group_id="123",
         applicant_qq="20002",
@@ -1414,7 +1450,9 @@ async def test_catch_up_waits_before_platform_approval(monkeypatch):
     )
 
     assert result.platform_status == "succeeded"
-    assert events == [("delay_range", (5, 15)), ("approve", "paced-catch-up")]
+    assert events[0][0] == "delay_range"
+    assert events[0][1][0] == events[0][1][1] and 0 <= events[0][1][0] <= 15
+    assert events[1:] == [("approve", "paced-catch-up")]
 
 
 @pytest.mark.asyncio
@@ -1451,6 +1489,7 @@ async def test_reconcile_does_not_catch_up_ineligible_request(monkeypatch, case)
     monkeypatch.setattr(module.time, "time", lambda: 1000)
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     assert context.llm_calls == []
     assert platform_calls == []
@@ -1488,9 +1527,11 @@ async def test_reconcile_limits_catch_up_batch_and_continues_next_cycle(monkeypa
     monkeypatch.setattr(module, "set_group_request", fake_set_group_request)
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     assert platform_flags == ["111"]
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
     assert platform_flags == ["111", "222"]
 
 
@@ -1518,6 +1559,7 @@ async def test_reconcile_isolates_unexpected_system_request_failure(monkeypatch)
     )
 
     await plugin._reconcile_platform("napcat-1")
+    await drain_reviews(plugin)
 
     # The broken row is isolated in the persistence pass; only the good row
     # reaches the catch-up pass.
@@ -1647,7 +1689,7 @@ async def test_empty_answer_wait_replaced_by_answer(
         plugin.audit_store.close()
         plugin.audit_store = None
     first = empty_request_event()
-    await plugin.handle_group_request(first)
+    await deliver_request(plugin, first)
     if not audit_enabled:
         assert not env.context.llm_calls and not env.approvals and not plugin._empty_answer_tasks
         await plugin.terminate()
@@ -1659,12 +1701,12 @@ async def test_empty_answer_wait_replaced_by_answer(
 
     second = empty_request_event("empty-first" if same_flag else "answer-second")
     second.message_obj.raw_message["comment"] += "github"
-    await plugin.handle_group_request(second)
+    await deliver_request(plugin, second)
     env.release.set()
     await asyncio.gather(*tasks, return_exceptions=True)
     # Replayed old flags cannot trigger catch-up processing after replacement.
     if audit_enabled and not same_flag:
-        await plugin.handle_group_request(first)
+        await deliver_request(plugin, first)
     assert len(env.context.llm_calls) == 1
     assert len(env.approvals) == 1
     assert env.approvals[0]["flag"] == second.message_obj.raw_message["flag"]
@@ -1686,10 +1728,10 @@ async def test_empty_answer_timeout_handles_latest_request_once(
     env = empty_answer_runtime
     plugin = env.plugin
     plugin.config["group_audits"][0]["failure_action"] = failure_action
-    await plugin.handle_group_request(empty_request_event())
+    await deliver_request(plugin, empty_request_event())
     await env.entered.wait()
-    await plugin.handle_group_request(empty_request_event())
-    await plugin.handle_group_request(empty_request_event("empty-second"))
+    await deliver_request(plugin, empty_request_event())
+    await deliver_request(plugin, empty_request_event("empty-second"))
     # A catch-up poll must join the same waiting window.
     await plugin._review_application(
         group_config=plugin.config["group_audits"][0],
@@ -1720,11 +1762,11 @@ async def test_empty_answer_timeout_handles_latest_request_once(
 async def test_empty_answer_wait_is_scoped_and_cancelled_on_unload(empty_answer_runtime):
     env = empty_answer_runtime
     plugin = env.plugin
-    await plugin.handle_group_request(empty_request_event())
+    await deliver_request(plugin, empty_request_event())
     await env.entered.wait()
     other = empty_request_event("other-applicant")
     other.message_obj.raw_message.update(user_id=30003, comment="github")
-    await plugin.handle_group_request(other)
+    await deliver_request(plugin, other)
     assert len(plugin._pending_empty_reviews) == 1
     tasks = list(plugin._empty_answer_tasks)
     await plugin.terminate()
@@ -1740,7 +1782,7 @@ async def test_empty_answer_wait_is_scoped_and_cancelled_on_unload(empty_answer_
 async def test_answer_from_other_scope_does_not_cancel_wait(empty_answer_runtime, scope):
     env = empty_answer_runtime
     plugin = env.plugin
-    await plugin.handle_group_request(empty_request_event())
+    await deliver_request(plugin, empty_request_event())
     await env.entered.wait()
     event = empty_request_event("other-scope")
     event.message_obj.raw_message["comment"] += "github"
@@ -1751,7 +1793,7 @@ async def test_answer_from_other_scope_does_not_cancel_wait(empty_answer_runtime
         )
     else:
         event.get_platform_id = lambda: "napcat-other"
-    await plugin.handle_group_request(event)
+    await deliver_request(plugin, event)
     assert len(plugin._pending_empty_reviews) == 1
     env.release.set()
     await asyncio.gather(*list(plugin._empty_answer_tasks))
@@ -1765,7 +1807,7 @@ async def test_invite_policy_does_not_wait_for_answer(empty_answer_runtime):
     env.plugin.config["group_audits"][0]["invite_action"] = "approve"
     event = empty_request_event()
     event.message_obj.raw_message["comment"] = ""
-    await env.plugin.handle_group_request(event)
+    await deliver_request(env.plugin, event)
     assert not env.plugin._pending_empty_reviews
     assert not env.delays and not env.context.llm_calls
     assert len(env.approvals) == 1
@@ -1775,7 +1817,7 @@ async def test_invite_policy_does_not_wait_for_answer(empty_answer_runtime):
 @pytest.mark.asyncio
 async def test_disabled_group_is_not_reviewed_after_wait(empty_answer_runtime):
     env = empty_answer_runtime
-    await env.plugin.handle_group_request(empty_request_event())
+    await deliver_request(env.plugin, empty_request_event())
     await env.entered.wait()
     env.plugin.config["group_audits"][0]["enabled"] = False
     env.release.set()
@@ -1790,18 +1832,22 @@ async def test_reconcile_loop_discovers_active_platform_with_empty_database(monk
     plugin = module.QQGroupAuditorPlugin(FakeContext(), plugin_config())
     assert plugin.audit_store.platform_ids() == []
     visited = []
+    observed = asyncio.Event()
 
     async def stop_after_first_platform(platform_id):
         visited.append(platform_id)
-        raise asyncio.CancelledError
+        observed.set()
 
     monkeypatch.setattr(module, "onebot_platform_ids", lambda context: ["napcat-1"])
     monkeypatch.setattr(plugin, "_poll_platform", stop_after_first_platform)
 
+    loop = asyncio.create_task(plugin._reconcile_loop())
+    await asyncio.wait_for(observed.wait(), 1)
+    loop.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await plugin._reconcile_loop()
-
+        await loop
     assert visited == ["napcat-1"]
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio

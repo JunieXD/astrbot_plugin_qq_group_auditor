@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import copy, deepcopy
+import math
 from typing import Any
 
 from .llm_usage import field
@@ -12,6 +13,8 @@ DEFAULT_LLM_REVIEW = {
     "ecnu_structured_output": True,
     "ecnu_thinking": "inherit",
     "ecnu_reasoning_effort": "low",
+    "timeout_seconds": 45,
+    "slow_seconds": 15,
 }
 ECNU_EFFORTS = {
     "ecnu-plus": {"low", "medium", "xhigh"},
@@ -59,6 +62,15 @@ def normalize_llm_review(raw: Any) -> dict[str, Any]:
         value = str(raw.get(name) or result[name]).strip().lower()
         if value in allowed:
             result[name] = value
+    for name, minimum in (("timeout_seconds", 1), ("slow_seconds", 0)):
+        try:
+            value = float(raw.get(name, result[name]))
+            if math.isfinite(value):
+                result[name] = max(minimum, min(300, value))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if result["slow_seconds"]:
+        result["slow_seconds"] = min(result["slow_seconds"], result["timeout_seconds"])
     return result
 
 
@@ -67,7 +79,9 @@ def ecnu_request_provider(provider: Any, options: dict[str, Any]) -> Any | None:
 
     AstrBot 4.x can drop generation kwargs in _prepare_chat_payload. Use its
     existing custom_extra_body path on a private adapter copy, preserving
-    auth, proxy, timeout, retries and the normalized/raw usage response.
+    auth, proxy and the normalized/raw usage response. Bound this plugin's
+    SDK timeout and disable invisible SDK retries; the review has its own total
+    deadline, including the optional invalid-JSON retry.
     """
     get_model = getattr(provider, "get_model", None)
     model = str(get_model() or "").strip().lower() if callable(get_model) else ""
@@ -101,7 +115,7 @@ def ecnu_request_provider(provider: Any, options: dict[str, Any]) -> Any | None:
     # text_chat rotates client.api_key, so copying only provider_config would
     # still mutate shared state. with_options isolates SDK options while
     # reusing the provider-owned HTTP connection pool; do not close it here.
-    request_provider.client = client.with_options()
+    request_provider.client = client.with_options(timeout=options["timeout_seconds"], max_retries=0)
     if request_provider.client is client:
         raise RuntimeError("ECNU 审核无法隔离模型客户端")
     return request_provider

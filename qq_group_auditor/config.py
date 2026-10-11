@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "group_audits": [],
     "background_sync_enabled": True,
     "background_sync_interval_seconds": 600,
+    "recovery_probe_interval_seconds": 30,
     "automation_pacing": DEFAULT_PACING,
 }
 VALID_FAILURE_ACTIONS = {"ignore", "reject"}
@@ -147,6 +148,11 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     except (TypeError, ValueError, OverflowError):
         interval = 600
     config["background_sync_interval_seconds"] = max(300, min(86400, interval))
+    try:
+        probe = int(config.get("recovery_probe_interval_seconds", 30))
+    except (TypeError, ValueError, OverflowError):
+        probe = 30
+    config["recovery_probe_interval_seconds"] = max(30, min(300, probe))
     config["automation_pacing"] = normalize_pacing(config.get("automation_pacing"), DEFAULT_PACING)
     config["llm_statistics"] = normalize_statistics(config.get("llm_statistics"))
     config["llm_review"] = normalize_llm_review(config.get("llm_review"))

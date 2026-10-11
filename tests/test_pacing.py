@@ -359,7 +359,7 @@ async def test_hot_reload_upgrades_shared_guard_without_replacing_lock_or_except
     assert upgraded is legacy
     assert upgraded.locks is locks and upgraded.accounts is accounts
     assert upgraded.deferred_error is old_error
-    assert upgraded.scheduling_version == 4
+    assert upgraded.scheduling_version == 5
     calls = []
 
     async def action():
@@ -522,11 +522,12 @@ async def test_observer_failure_does_not_prevent_approval(runtime):
 
 
 @pytest.mark.asyncio
-async def test_upgrade_v3_preserves_live_queue_and_wakes_existing_waiters(manual_runtime):
+@pytest.mark.parametrize("version", [3, 4])
+async def test_upgrade_preserves_live_queue_and_wakes_existing_waiters(manual_runtime, version):
     guard, clock = manual_runtime
-    class V3Guard(pacing.ActionGuard):
-        scheduling_version = 3
-    old = V3Guard(guard.path)
+    class OldGuard(pacing.ActionGuard):
+        scheduling_version = version
+    old = OldGuard(guard.path)
     calls = []
     async def action():
         calls.append(clock.now)
@@ -537,7 +538,37 @@ async def test_upgrade_v3_preserves_live_queue_and_wakes_existing_waiters(manual
     manager = SimpleNamespace(_qq_automation_guard_v1=old)
     upgraded = pacing.get_guard(SimpleNamespace(platform_manager=manager), guard.path.parent)
     assert upgraded is old and upgraded._pending is pending and upgraded._changed is changed
+    assert upgraded.scheduling_version == 5
     assert len(upgraded._pending['bot']) == 1
     await clock.advance(5)
     await task
     assert calls == [1005] and upgraded._pending['bot'] == []
+
+
+def test_detected_recovery_is_durable_and_does_not_clear_existing_guards(tmp_path, monkeypatch):
+    monkeypatch.setattr(pacing.time, "time", lambda: 1000)
+    guard = pacing.ActionGuard(tmp_path / "state.json")
+    guard.accounts["bot"] = {"recovery_until": 1080, "paused_until": 1300,
+                             "operations": {"unknown": {"status": "unknown", "expires": 2000}}}
+    guard.defer_recovery("bot", 60)
+    restored = pacing.ActionGuard(guard.path)
+    assert restored.accounts["bot"]["recovery_until"] == 1080
+    assert restored.accounts["bot"]["paused_until"] == 1300
+    assert restored.accounts["bot"]["operations"]["unknown"]["status"] == "unknown"
+    restored.defer_recovery("bot", 180)
+    assert pacing.ActionGuard(guard.path).accounts["bot"]["recovery_until"] == 1180
+
+
+@pytest.mark.asyncio
+async def test_online_recheck_cannot_shorten_detected_recovery(runtime):
+    guard, now, _ = runtime
+    guard.accounts["bot"] = {"was_offline": True}
+    guard.defer_recovery("bot", 180)
+    calls = []
+
+    async def action():
+        calls.append(now[0])
+
+    await guard.run(**options(action))
+    assert calls == [1180]
+    assert not guard.accounts["bot"].get("was_offline")
